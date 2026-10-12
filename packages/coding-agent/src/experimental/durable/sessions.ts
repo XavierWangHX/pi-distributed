@@ -4,7 +4,7 @@ import { basename, join, resolve } from "node:path";
 import lockfile from "proper-lockfile";
 import { getAgentDir } from "../../config.ts";
 
-/** One session directory holding `session.sqlite`, locked by this process. */
+/** One session directory — the registry and lock entry — naming its PostgreSQL schema. */
 export interface SessionLocation {
 	id: string;
 	directory: string;
@@ -52,5 +52,7 @@ export async function selectSession(cwdInput: string, continueSession: boolean):
 	} catch (error) {
 		throw new Error(`Session is already open in another process: ${directory}`, { cause: error });
 	}
-	return { id: basename(directory), directory, database: join(directory, "session.sqlite"), cwd, created, release };
+	const id = basename(directory);
+	const schema = `pi_${id.replaceAll("-", "")}`;
+	return { id, directory, database: schema, cwd, created, release };
 }

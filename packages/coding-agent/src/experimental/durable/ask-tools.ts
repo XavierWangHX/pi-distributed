@@ -1,10 +1,8 @@
 // One-shot headless round: ask the agent to enumerate its visible tools. Same wiring as main.ts.
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { AssistantEntry, Harness } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { openPgStorage } from "@earendil-works/pi-durable/storage/pg";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
 import {
@@ -17,6 +15,7 @@ import { createMultiEnv, MultiEnvs } from "./multienv.ts";
 import { createSubagent } from "./subagent.ts";
 
 const cwd = process.cwd();
+const PG_URL = process.env.PI_PG_URL ?? "postgres://pi:pi@localhost:5433/durable";
 const modelRuntime = await ModelRuntime.create();
 const settingsManager = SettingsManager.create(cwd);
 configureHarnessHttp(settingsManager);
@@ -25,8 +24,8 @@ const multienvs = new MultiEnvs(cwd);
 registry.install(createSubagent(multienvs));
 registry.install(createMultiEnv(multienvs));
 
-const db = join(mkdtempSync(join(tmpdir(), "pi-ask-tools-")), "session.sqlite");
-const harness = await Harness.open(await openNodeSqliteStorage(db), {
+const db = `pi_ask_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+const harness = await Harness.open(await openPgStorage(PG_URL, { schema: db }), {
 	models: modelRuntime,
 	registry,
 	settings: createHarnessSettings(settingsManager),

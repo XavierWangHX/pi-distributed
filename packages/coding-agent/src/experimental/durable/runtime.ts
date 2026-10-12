@@ -14,7 +14,7 @@ import {
 	type Submission,
 	type TaskGraph,
 } from "@earendil-works/pi-durable";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import { openPgStorage } from "@earendil-works/pi-durable/storage/pg";
 import { ModelRuntime } from "../../core/model-runtime.ts";
 import { SettingsManager } from "../../core/settings-manager.ts";
 import {
@@ -28,6 +28,9 @@ import { selectSession } from "./sessions.ts";
 import { createSubagent } from "./subagent.ts";
 
 const context = BACKGROUND_CONTEXT;
+
+/** Where the durable sessions live: one schema per session. */
+const PG_URL = process.env.PI_PG_URL ?? "postgres://pi:pi@localhost:5433/durable";
 
 export interface ModelSummary extends ModelRef {
 	readonly name: string;
@@ -143,7 +146,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const pendingReports: unknown[] = [];
 		let report: (error: unknown) => void = (error) => pendingReports.push(error);
 		harness = await Harness.open(
-			await openNodeSqliteStorage(location.database),
+			await openPgStorage(PG_URL, { schema: location.database }),
 			{
 				models: modelRuntime,
 				registry,
