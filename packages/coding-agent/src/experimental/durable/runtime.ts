@@ -21,11 +21,11 @@ import {
 	configureHarnessHttp,
 	createCodingRegistry,
 	createHarnessSettings,
-	ExecutionEnvs,
 	findInitialAgentModel,
 } from "./harness-setup.ts";
+import { createMultiEnv, MultiEnvs } from "./multienv.ts";
 import { selectSession } from "./sessions.ts";
-import { Subagent } from "./subagent.ts";
+import { createSubagent } from "./subagent.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -129,7 +129,6 @@ function titleOf(entry: EntryRecord | undefined): { title?: string } {
 
 export async function openDurable(options: OpenDurableOptions = {}): Promise<OpenDurableResult> {
 	const location = await selectSession(options.cwd ?? process.cwd(), options.continueSession ?? false);
-	const envs = new ExecutionEnvs(location.cwd);
 	let harness: Harness | undefined;
 	try {
 		const modelRuntime = await ModelRuntime.create();
@@ -137,7 +136,9 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		configureHarnessHttp(settingsManager);
 		const settings = createHarnessSettings(settingsManager);
 		const registry = createCodingRegistry(settingsManager, location.cwd);
-		registry.install(Subagent);
+		const multienvs = new MultiEnvs(location.cwd);
+		registry.install(createSubagent(multienvs));
+		registry.install(createMultiEnv(multienvs));
 
 		const pendingReports: unknown[] = [];
 		let report: (error: unknown) => void = (error) => pendingReports.push(error);
@@ -147,7 +148,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 				models: modelRuntime,
 				registry,
 				settings,
-				env: envs.env,
+				env: multienvs.env,
 				onReport: (error) => report(error),
 			},
 			context,
@@ -357,7 +358,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 					try {
 						// Close writes no outcome: a running turn resumes with --continue.
 						await opened.close(context);
-						await envs.cleanup(context);
+						await multienvs.cleanup();
 					} finally {
 						await location.release();
 					}
