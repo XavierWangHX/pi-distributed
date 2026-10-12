@@ -10,7 +10,16 @@ import { defineDoc, defineExtension, defineTool, section } from "@earendil-works
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { Type } from "typebox";
-import { acceptHostKey, connectSsh, HostKeyUnknownError, RemoteExecutionEnv, scanHostKey } from "@earendil-works/pi-env";
+import {
+	acceptHostKey,
+	connectSsh,
+	Connection,
+	HostKeyUnknownError,
+	LocalExecutionEnv,
+	RemoteExecutionEnv,
+	scanHostKey,
+} from "@earendil-works/pi-env";
+import { localDaemon } from "@earendil-works/pi-env";
 
 interface RemoteTarget {
 	name: string;
@@ -39,7 +48,8 @@ export const Machine = defineDoc<{ target: string }>({
 export class MultiEnvs {
 	readonly #defaultCwd: string;
 	readonly #targets = new Map<string, RemoteTarget>();
-	readonly #localEnvs = new Map<string, NodeExecutionEnv>();
+	readonly #localEnvs = new Map<string, LocalExecutionEnv>();
+	#localConnection: Connection | undefined;
 	readonly #remoteEnvs = new Map<string, RemoteExecutionEnv>();
 
 	constructor(defaultCwd: string) {
@@ -84,7 +94,10 @@ export class MultiEnvs {
 			const directory = cwd ?? this.#defaultCwd;
 			let env = this.#localEnvs.get(directory);
 			if (env === undefined) {
-				env = new NodeExecutionEnv({ cwd: directory });
+				if (this.#localConnection === undefined) {
+					this.#localConnection = new Connection({ command: [localDaemon()] });
+				}
+				env = new LocalExecutionEnv({ connection: this.#localConnection, cwd: directory });
 				this.#localEnvs.set(directory, env);
 			}
 			return env;
@@ -140,6 +153,14 @@ export class MultiEnvs {
 		this.#remoteEnvs.clear();
 		for (const env of this.#localEnvs.values()) await env.cleanup(BACKGROUND_CONTEXT).catch(() => undefined);
 		this.#localEnvs.clear();
+		if (this.#localConnection !== undefined) {
+			try {
+				this.#localConnection.close();
+			} catch {
+				// A connection that already ended needs no closing.
+			}
+			this.#localConnection = undefined;
+		}
 	}
 }
 
