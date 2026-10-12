@@ -20,7 +20,7 @@ const modelRuntime = await ModelRuntime.create();
 const settingsManager = SettingsManager.create(cwd);
 configureHarnessHttp(settingsManager);
 const registry = createCodingRegistry(settingsManager, cwd);
-const multienvs = new MultiEnvs(cwd);
+const multienvs = await MultiEnvs.create(PG_URL, cwd);
 registry.install(createSubagent(multienvs));
 registry.install(createMultiEnv(multienvs));
 

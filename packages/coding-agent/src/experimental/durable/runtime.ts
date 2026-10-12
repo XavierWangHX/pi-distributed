@@ -139,7 +139,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		configureHarnessHttp(settingsManager);
 		const settings = createHarnessSettings(settingsManager);
 		const registry = createCodingRegistry(settingsManager, location.cwd);
-		const multienvs = new MultiEnvs(location.cwd);
+		const multienvs = await MultiEnvs.create(PG_URL, location.cwd);
 		registry.install(createSubagent(multienvs));
 		registry.install(createMultiEnv(multienvs));
 

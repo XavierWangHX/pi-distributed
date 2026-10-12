@@ -1,14 +1,15 @@
 // Multi-machine hands for the durable agent, conversation-routed: a `machine` document selects
 // which machine the conversation's native tools (read/write/edit/bash) execute on. `use_machine`
 // switches it; the Harness env callback reads the document and resolves the ExecutionEnv.
-// Targets come from ~/.pi/agent/targets.json; "local" (this machine) is always available.
-import { existsSync, readFileSync } from "node:fs";
+// Targets live in PostgreSQL (pi_machines.targets) — the sole source of truth, shared by every
+// session and immune to local file loss; "local" (this machine) is always available.
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
+import pg from "pg";
 import { Type } from "typebox";
 import {
 	acceptHostKey,
@@ -23,15 +24,17 @@ import { localDaemon } from "@earendil-works/pi-env";
 
 interface RemoteTarget {
 	name: string;
-	host: string;
+	kind: "ssh" | "docker";
+	host?: string;
 	user?: string;
 	port?: number;
 	identityFile?: string;
 	cwd?: string;
+	container?: string;
+	daemonPath?: string;
 	trustOnFirstUse?: boolean;
 }
 
-const TARGETS_FILE = join(homedir(), ".pi", "agent", "targets.json");
 const KNOWN_HOSTS = join(homedir(), ".pi", "agent", "multienv-known-hosts");
 
 /** The machine this conversation's tools execute on. A fork starts on its parent's machine. */
@@ -51,18 +54,74 @@ export class MultiEnvs {
 	readonly #localEnvs = new Map<string, LocalExecutionEnv>();
 	#localConnection: Connection | undefined;
 	readonly #remoteEnvs = new Map<string, RemoteExecutionEnv>();
+	#pg: pg.Client | undefined;
 
-	constructor(defaultCwd: string) {
+	private constructor(defaultCwd: string) {
 		this.#defaultCwd = defaultCwd;
-		if (!existsSync(TARGETS_FILE)) return;
-		try {
-			const parsed = JSON.parse(readFileSync(TARGETS_FILE, "utf8")) as { targets?: RemoteTarget[] };
-			for (const target of parsed.targets ?? []) {
-				if (target?.name && target.host) this.#targets.set(target.name, target);
-			}
-		} catch {
-			// A broken targets.json leaves the agent local-only; the native tools still work.
+	}
+
+	/** Connect the fleet database, ensure its table, and load every target. */
+	static async create(pgUrl: string, defaultCwd: string): Promise<MultiEnvs> {
+		const multienvs = new MultiEnvs(defaultCwd);
+		const client = new pg.Client({ connectionString: pgUrl });
+		await client.connect();
+		multienvs.#pg = client;
+		await client.query("CREATE SCHEMA IF NOT EXISTS pi_machines");
+		await client.query(`CREATE TABLE IF NOT EXISTS pi_machines.targets (
+			name TEXT PRIMARY KEY,
+			kind TEXT NOT NULL DEFAULT 'ssh' CHECK (kind IN ('ssh', 'docker')),
+			host TEXT, username TEXT, cwd TEXT, container TEXT, daemon_path TEXT,
+			trust_on_first_use BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at BIGINT NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint,
+			last_registered BIGINT
+		)`);
+		const rows = await client.query(
+			"SELECT name, kind, host, username, cwd, container, daemon_path, trust_on_first_use FROM pi_machines.targets",
+		);
+		for (const row of rows.rows) {
+			multienvs.#targets.set(row.name as string, {
+				name: row.name as string,
+				kind: row.kind as "ssh" | "docker",
+				host: row.host ?? undefined,
+				user: row.username ?? undefined,
+				cwd: row.cwd ?? undefined,
+				container: row.container ?? undefined,
+				daemonPath: row.daemon_path ?? undefined,
+				trustOnFirstUse: row.trust_on_first_use ?? true,
+			});
 		}
+		return multienvs;
+	}
+
+	/** Register a target durably (upsert) and make it usable right away. */
+	async addTarget(target: RemoteTarget): Promise<void> {
+		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
+		await this.#pg.query(
+			`INSERT INTO pi_machines.targets (name, kind, host, username, cwd, container, daemon_path, trust_on_first_use)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, host = excluded.host,
+				username = excluded.username, cwd = excluded.cwd, container = excluded.container,
+				daemon_path = excluded.daemon_path, trust_on_first_use = excluded.trust_on_first_use,
+				last_registered = (extract(epoch from now()) * 1000)::bigint`,
+			[
+				target.name,
+				target.kind,
+				target.host ?? null,
+				target.user ?? null,
+				target.cwd ?? null,
+				target.container ?? null,
+				target.daemonPath ?? null,
+				target.trustOnFirstUse ?? true,
+			],
+		);
+		this.#targets.set(target.name, target);
+	}
+
+	/** Remove a target durably; a conversation already on it falls back to local at its next use. */
+	async removeTarget(name: string): Promise<void> {
+		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
+		await this.#pg.query("DELETE FROM pi_machines.targets WHERE name = $1", [name]);
+		this.#targets.delete(name);
 	}
 
 	names(): string[] {
@@ -160,6 +219,10 @@ export class MultiEnvs {
 				// A connection that already ended needs no closing.
 			}
 			this.#localConnection = undefined;
+		}
+		if (this.#pg !== undefined) {
+			await this.#pg.end().catch(() => undefined);
+			this.#pg = undefined;
 		}
 	}
 }
