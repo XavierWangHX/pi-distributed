@@ -154,9 +154,12 @@ export class SqliteStorage implements Storage {
 	}
 
 	/** Initialize storage over an owned SQLite database facade. */
-	static async open(db: SqliteDatabase): Promise<SqliteStorage> {
+	static async open(
+		db: SqliteDatabase,
+		options: { readonly migrate?: (db: SqliteDatabase) => Promise<void> } = {},
+	): Promise<SqliteStorage> {
 		try {
-			await applySqliteMigrations(db);
+			await (options.migrate ?? ((database: SqliteDatabase) => applySqliteMigrations(database)))(db);
 			const metadata = await db.get<MetadataRow>(
 				"SELECT next_id, next_seq FROM durable_metadata WHERE singleton = 1",
 			);
@@ -838,7 +841,7 @@ export class SqliteStorage implements Storage {
 	}
 
 	private async claimId(executor: SqliteExecutor, id: Id<string>, table: TableName): Promise<void> {
-		await executor.run("INSERT OR IGNORE INTO record_ids (id, record_type) VALUES (?, ?)", id, table);
+		await executor.run("INSERT INTO record_ids (id, record_type) VALUES (?, ?) ON CONFLICT (id) DO NOTHING", id, table);
 	}
 
 	private async applyDocumentActions(
