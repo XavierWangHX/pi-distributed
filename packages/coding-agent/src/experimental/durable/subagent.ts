@@ -166,10 +166,9 @@ export function createSubagent(machines: SubagentMachines): Extension {
 					if (entries.length === 0) {
 						return { output: [{ type: "text", text: "(no named subagents yet; pass name when creating one)" }] };
 					}
-					const lines = entries.map(
-						([name, entry]) => `- ${name} (machine ${entry.machine}, conversation ${entry.conversation}): ${entry.task.slice(0, 80)}`,
-					);
-					return { output: [{ type: "text", text: lines.join("\n") }] };
+					// The model addresses subagents by name only; ids live in details for the UI.
+					const lines = entries.map(([name, entry]) => `- ${name} (machine ${entry.machine}): ${entry.task.slice(0, 80)}`);
+					return { output: [{ type: "text", text: lines.join("\n") }], details: { entries } };
 				},
 			}),
 		],
