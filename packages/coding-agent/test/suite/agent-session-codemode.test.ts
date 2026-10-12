@@ -495,6 +495,16 @@ describe("codemode options and store", () => {
 				text: "@options only supports `max_output_tokens` and `timeout_ms`; got `yield`",
 			},
 		]);
+
+		// #10631: a misplaced options line fails before the script runs instead of running without a deadline.
+		const misplaced = await run(harness, '// count\n// @options: {"timeout_ms": 200}\nwhile (true) {}');
+		expect(misplaced.isError).toBe(true);
+		expect(misplaced.content).toEqual([
+			{
+				type: "text",
+				text: "The // @options: line must be the first line of the input; found one on line 2",
+			},
+		]);
 	});
 
 	it("limits script memory so runaway allocations fail inside the script", async () => {
@@ -539,6 +549,18 @@ describe("codemode options and store", () => {
 
 		const small = await run(harness, "return { ok: true };");
 		expect((small.details as unknown as CodemodeToolDetails).fullOutputPath).toBeUndefined();
+	});
+
+	// #10678: joining the text items was quadratic, about 10 s here for the item limit.
+	it("formats output at the item limit in linear time", async () => {
+		const harness = await setup();
+		const startedAt = performance.now();
+		const result = await run(harness, 'for (let i = 0; i < 100000; i++) text("");');
+		const elapsed = performance.now() - startedAt;
+		rmSync((result.details as unknown as CodemodeToolDetails).fullOutputPath ?? "", { force: true });
+		expect(result.isError).toBe(false);
+		expect(resultText(result)).toContain("==> text 100000/100000 <==");
+		expect(elapsed).toBeLessThan(5000);
 	});
 
 	it("resolves bash calls to structured results, also for non-zero exit codes", async () => {

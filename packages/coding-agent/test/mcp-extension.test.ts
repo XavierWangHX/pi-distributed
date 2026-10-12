@@ -282,8 +282,9 @@ describe("MCP tools", () => {
 	it("declares the CallToolResult scripts receive, keeping references in the server's output schema", () => {
 		const content =
 			'content: Array<{ data?: string; mimeType?: string; text?: string; type: "text" | "image" | "audio" | "resource_link" | "resource"; [key: string]: unknown; }>; isError?: boolean;';
+		// #10416: without an output schema, structured content may be any JSON value.
 		expect(renderToolOutputType(createMcpResultSchema(undefined) as never)).toBe(
-			`{ ${content} structuredContent?: { [key: string]: unknown; }; [key: string]: unknown; }`,
+			`{ ${content} structuredContent?: unknown; [key: string]: unknown; }`,
 		);
 
 		const hit = { type: "object", properties: { id: { type: "string" } }, required: ["id"] };
@@ -333,6 +334,12 @@ describe("MCP tools", () => {
 		expect((await convertMcpResult("docs", "t", { content: [], structuredContent: { n: 1 } })).content).toEqual([
 			{ type: "text", text: '{\n  "n": 1\n}' },
 		]);
+		// #10416: array structured content reaches the model as JSON and scripts as sent.
+		expect(await convertMcpResult("docs", "t", { content: [], structuredContent: [{ id: 1 }] })).toEqual({
+			content: [{ type: "text", text: '[\n  {\n    "id": 1\n  }\n]' }],
+			details: { server: "docs", tool: "t" },
+			structuredContent: { content: [], structuredContent: [{ id: 1 }] },
+		});
 		expect(await convertMcpResult("docs", "t", { content: [{ type: "text", text: "nope" }], isError: true })).toEqual(
 			{
 				content: [{ type: "text", text: "nope" }],
@@ -435,7 +442,9 @@ describe("MCP connections", () => {
 	const servers: InMemoryTransport[] = [];
 
 	/** In-memory server that answers initialize, tools/list, and tools/call with "ok". */
-	function createTransport(options: { expireFirstCall?: boolean; methods?: string[]; noTools?: boolean } = {}) {
+	function createTransport(
+		options: { expireFirstCall?: boolean; methods?: string[]; noTools?: boolean; resources?: boolean } = {},
+	) {
 		const pair = createInMemoryTransportPair();
 		servers.push(pair.server);
 		pair.server.onMessage((message) => {
@@ -448,7 +457,10 @@ describe("MCP connections", () => {
 							id: message.id,
 							result: {
 								protocolVersion: LATEST_PROTOCOL_VERSION,
-								capabilities: options.noTools ? { prompts: {} } : { tools: {} },
+								capabilities: {
+									...(options.noTools ? { prompts: {} } : { tools: {} }),
+									...(options.resources ? { resources: {} } : {}),
+								},
 								serverInfo: { name: "fake", version: "1.0.0" },
 							},
 						}
@@ -772,6 +784,19 @@ for await (const line of createInterface({ input: process.stdin })) {
 		);
 		expect(await connection.callTool("echo", {}, {})).toEqual({ content: [{ type: "text", text: "ok" }] });
 		expect(() => connection.oauthSettings()).toThrow("oauth.clientSecret");
+		await connection.close();
+	});
+
+	// #10526: listing every resource can take long (a large drive), so connecting must not wait for it.
+	it("connects to servers with resources without listing them", async () => {
+		const methods: string[] = [];
+		const { connection } = connect({ name: "fake", config: { command: "unused" }, source: "test" }, [
+			() => createTransport({ resources: true, methods }),
+		]);
+		await connection.getClient();
+		expect(connection.state).toBe("connected");
+		expect(connection.hasResources).toBe(true);
+		expect(methods).toEqual(["initialize", "tools/list"]);
 		await connection.close();
 	});
 });

@@ -1,7 +1,7 @@
-# Pico5 specification
+# Durable specification
 
-Pico5 is a durable, extensible agent harness. This document is normative.
-Pico5 uses existing package types as follows:
+`@earendil-works/pi-durable` is a durable, extensible agent harness. This document is normative.
+It uses existing package types as follows:
 
 ```ts
 import type {
@@ -34,7 +34,7 @@ type JsonObject = { [key: string]: JsonValue };
 type TaskOutcomeError = { message: string; detail?: JsonValue };
 ```
 
-Pico5 targets the transcript `SystemMessage` contract from pi-ai PR
+Durable targets the transcript `SystemMessage` contract from pi-ai PR
 [#9548](https://github.com/earendil-works/pi/pull/9548). `Message` includes that
 type once the PR lands.
 
@@ -137,7 +137,7 @@ string adds or replaces a section, while `null` removes it. `toolsRemoved` is
 applied before `toolsAdded` within one message. Replaying every system message
 in transcript order yields the effective prompt and tool set.
 
-Pico always writes `content: ""`. Every prompt part, including the preamble, is
+Durable always writes `content: ""`. Every prompt part, including the preamble, is
 a named section resolved from the conversation's agent (section 7.4).
 
 ```ts
@@ -295,9 +295,7 @@ separate consumers. Older stored history is available through the owning
 
 ### 2.2 Public Harness surface
 
-This is the v1 host-facing API. Pico5 is not implemented yet, but implementations
-must expose this shape rather than inventing a different facade during package
-24.
+This is the v1 host-facing API.
 
 ```ts
 type ModelRef = {
@@ -440,8 +438,12 @@ type AgentState = {
   extensions?: string[] | { add?: string[]; remove?: string[] };
   /** Filters the selected extensions' tools: the enabled tools. An array enables exactly these, in order. */
   tools?: string[] | { remove: string[] };
-  /** Filters the enabled tools the model may call: the tools it is offered. An array offers exactly these, in order. */
-  modelTools?: string[] | { remove: string[] };
+  /**
+   * Filters the enabled tools the model may call: the tools it is offered. Unset: all but deferred ones. An array:
+   * exactly these, in order, deferred ones too. An object: all but deferred ones and those in `remove`, in registry
+   * order, followed by the deferred tools in `add` that are not in `remove`, in `add` order.
+   */
+  modelTools?: string[] | { remove?: string[]; add?: string[] };
   /** Rendered after every extension section, as the section `instructions`. */
   instructions?: string;
   /** Directory within the environment's file system, passed to `HarnessOptions.env`. */
@@ -460,7 +462,10 @@ type AgentChange = {
     | { readonly add?: readonly Extension[]; readonly remove?: readonly Extension[] }
     | null;
   readonly tools?: readonly ToolRegistration[] | { readonly remove: readonly ToolRegistration[] } | null;
-  readonly modelTools?: readonly ToolRegistration[] | { readonly remove: readonly ToolRegistration[] } | null;
+  readonly modelTools?:
+    | readonly ToolRegistration[]
+    | { readonly remove?: readonly ToolRegistration[]; readonly add?: readonly ToolRegistration[] }
+    | null;
   readonly instructions?: string | null;
   readonly cwd?: string | null;
 };
@@ -477,6 +482,8 @@ type Agent<Tool extends ToolRegistration = ToolRegistration> = {
   readonly tools: readonly Tool[];
   /** Nested calls resolve among these: enabled, and `callers` includes `tools`. */
   readonly callable: readonly Tool[];
+  /** Enabled deferred tools the model may call and is not offered yet, in registry order. */
+  readonly deferred: readonly Tool[];
   /** Extension sections, then `instructions` when set. */
   readonly sections: readonly PromptSection<Tool>[];
   readonly instructions?: string;
@@ -619,10 +626,9 @@ declare const Harness: {
 };
 ```
 
-This intentionally retains the useful Pico3 host shape. It removes Pico3's
-fixed `rewindable()`/`sticky()` accessors, namespace router, semantic view events,
-and manual Chord view bridge. Typed Pico5 documents and the structural
-conversation watch replace those surfaces. `submit()` durably admits either a
+Typed documents and the structural conversation watch are the state surfaces;
+there are no fixed rewindable or sticky accessors, namespace router, semantic view
+events, or manual Chord view bridge. `submit()` durably admits either a
 user input or passive entry write and returns one `Submission` that tracks its
 settlement.
 
@@ -1317,7 +1323,7 @@ alive at the target commit.
 
 ### 3.4 Mutation ownership
 
-Pico uses Chord Delta's Astra-immutable transaction shape directly:
+Durable uses Chord Delta's immutable transaction shape directly:
 
 ```ts
 interface Prepared<T extends object> {
@@ -1349,7 +1355,7 @@ operations, and computes `value` with the optimized immutable applier before
 Storage admission. Unchanged subtrees are structurally shared with `base`.
 Operation placement payloads may also be shared with `value`; mutating either a
 prepared operation or an immutable revision is unsupported. Astra preserves an
-empty operation batch for changes it proves are no-ops, but Pico performs no
+empty operation batch for changes it proves are no-ops, but Durable performs no
 additional whole-value equality pass for nonempty structural batches.
 
 `abort()` is idempotent. `adopt()` accepts only a prepared result from that
@@ -1818,8 +1824,8 @@ commit, so the checkpoint or outcome is atomic with the callback's entries,
 documents, and child tasks and is type-checked against the task's checkpoint and
 result types. Returning nothing leaves the state unchanged. A terminal or
 completing state drops the memos. A `waiting` state ends the invocation even
-when its checkpoint is unchanged; it rejects when `on` names a missing task, the
-task itself, or a task on its owner chain, which could never finish first, and
+when its checkpoint is unchanged; it rejects when `on` names a missing task or
+closes a wait cycle (section 5.5), which no task on it could finish first, and
 an empty `on` resumes at the next scheduling pass. `pending` is never returned;
 only reconciliation and handover write it.
 
@@ -1908,9 +1914,8 @@ commits and joins invocations before closing storage. Already-running watch call
 caller-owned. Later runtime commits reject, and close writes no task outcome. Closing
 starts no fresh phase or abort invocation. It does not set abort marks,
 terminalize tasks, retire task documents, or publish document retirement. The
-hosting layer withdraws services and
-detaches clients before it closes the Harness, for example by disposing its Chord
-facet host (see the Chord usage guide); reconnecting to a reopened Session
+hosting layer stops exposing Harness state to clients before it closes the
+Harness, for example by closing the Chord host whose objects serve it; reconnecting to a reopened Session
 hydrates the last committed state and resumes recovery from its durable
 checkpoints.
 
@@ -2215,8 +2220,17 @@ finish.
 The task stops without an invocation and resumes at `checkpoint` once every task
 in `on` is terminal. `on` may name any tasks, including already terminal ones;
 tasks the waiting task does not own, whose `owner` is not the waiting task,
-require `policy: "allSettled"`. `on` may not name a missing task, the task
-itself, or a task on its owner chain (section 5.1). With `failFast`, the first
+require `policy: "allSettled"`. `on` may not name a missing task or close a
+cycle in the wait-for graph (section 5.1), whose edges run from each task to the
+tasks it waits on and to its live ordinary owned work, which holds it as
+`completing`. A task waiting on itself, or on an owner that holds it, closes the
+shortest such cycles; a background task may wait on the owner of its
+conversation, which it does not hold. The check follows both kinds of edge from
+the tasks in `on`, visiting each task once, and the rejection names the cycle.
+Only durable waits are edges: a wait held only in memory, such as
+`runtime.waitForTask()` or a nested call's, is not checked. An abort-marked
+task waits only for its owned work, so its `on` is no edge.
+With `failFast`, the first
 task in `on` that holds or ends with a non-`completed` outcome gives every other
 live task in `on` an abort mark, in the scheduler's next reconcile commit. The waiting task itself is not marked:
 it resumes once all of `on` is terminal and reads their outcomes with
@@ -3016,6 +3030,19 @@ narrows which of its model-callable tools the model is offered, for example
 only the code mode tool, while the others stay callable by tools. Neither can
 widen what `tools` enables.
 
+A `deferred` tool is not offered to the model until it is loaded: `modelTools`
+must name it, in its array or its `add`. Other tools can call it any time. A
+tool loads deferred tools with `control.addTools`, which writes their names to
+`modelTools` (section 8.5); since `pi.agent` is rewindable and forks as of the
+fork's entry, loaded tools are per branch, and a baseline after a head marker
+declares them, built from the resolved tools. Loaded tools follow the other
+tools in load order, so a load appends declarations to the transcript and the
+cached prefix holds. `@earendil-works/pi-durable/tool-search` provides the
+coding agent's `tool_search` (`createToolSearchExtension()`): it ranks
+`Agent.deferred` with BM25 over the tools' names, descriptions, and parameter
+names and descriptions, and loads the matches. The `codemode` section does not
+list deferred tools; scripts find them with `searchTools()`.
+
 Tools reach files and processes only through `api.env`, never through an
 environment captured when the tool was built. The tool task builds it for each
 call with `HarnessOptions.env` from the conversation's ID and `cwd` (section
@@ -3125,7 +3152,13 @@ the newline count, the byte range of a span of lines, and the decoded sizes of
 that span and its first line, so a caller can count and locate lines without
 moving the file. `openDirReader`
 pages a directory in file-system order, reading metadata only for the entries
-it returns and skipping entries removed meanwhile. All operations stop when
+it returns and skipping entries removed meanwhile. The optional `listFiles`
+lists a whole tree for indexes such as file completion: files, directories and
+symbolic links (not followed), relative with `/` separators, depth first in
+byte order of names, without `.git` and, inside git work trees, without what
+git ignores; `maxEntries`, `maxBytes` and `timeoutMs` end it early with
+`truncated`. An environment that cannot list right now fails with
+`not_supported`, and callers fall back to their own walk. All operations stop when
 their context is aborted, and only that call's work stops: a timeout or abort
 kills only that command's processes. `cleanup()` kills every command the
 environment still runs and belongs to its owner's shutdown, never to a single
@@ -3385,9 +3418,9 @@ is not a lock against `bash` or other processes.
 
 ### 7.4 System prompt and dynamic tools
 
-Pico has no durable prompt sections. The conversation's resolved agent produces
+Durable has no durable prompt sections. The conversation's resolved agent produces
 the desired sections for each request; the transcript's `pi.system` entries are
-the only durable record of what the model saw. Pico stores prompt and tool
+the only durable record of what the model saw. Durable stores prompt and tool
 changes directly as PR #9548 `SystemMessage` values at their transcript
 positions, always with empty `content`:
 
@@ -3510,7 +3543,7 @@ rebaseline adds every desired tool.
 The rendered strings stored in historical `SystemMessage.sections` remain
 authoritative even if the current renderer changes. Pi-ai decides whether to
 send the messages positionally to a capable provider or fold them into one
-leading system message; Pico does not rewrite its stored transcript for provider
+leading system message; Durable does not rewrite its stored transcript for provider
 compatibility.
 
 ### 7.5 Extension reload
@@ -3680,7 +3713,7 @@ The initial implementation provides:
 | `pi.tool` | validate, hook, execute, persist output and details, append result |
 | `pi.compaction` | select a transcript range, summarize, place a headed summary |
 
-Generation uses `HarnessOptions.models` without a Pico-specific model adapter. It
+Generation uses `HarnessOptions.models` without a Durable-specific model adapter. It
 resolves `models.getModel(ref.provider, ref.modelId)`, builds a pi-ai `Context`
 from the prepared prompt/messages/tools, and calls `models.streamSimple()` with
 the task invocation's abort signal, the agent's thinking level, and the
@@ -4104,9 +4137,12 @@ and then commits once:
 
 - It edits the conversation's stored `pi.agent` `tools` and `modelTools` for
   every `addTools` name: an array gets the name appended unless it holds it
-  already, and `{ remove }` loses the name. An unset filter already lets every
-  tool through, and nothing is written for it. The next preparation offers the
-  tool when it resolves and the model may call it.
+  already, and `{ remove }` loses the name. An unset `tools` already enables
+  every tool, and nothing is written for it. An unset or object `modelTools`
+  also gets the name appended to its `add`, which loads a deferred tool and has
+  no effect for others. Names are written without consulting the registry, so a
+  tool that is not registered now is offered once it is again. The next
+  preparation offers the tool when it resolves and the model may call it.
 - When every result of the round requests `terminate`, or any requests
   `handoff`, it appends the handoff's `pi.reset` entry, if any, settles the
   run's inputs `done` with the tool-calling answer, removes `run` and `tools`,
@@ -4405,11 +4441,11 @@ interface DocumentObserver {
 }
 ```
 
-`documentState()` attaches Pico's committed document stream to Chord before
+`documentState()` attaches Durable's committed document stream to Chord before
 returning. The returned state is already hydrated with the exact shareable
 immutable revision, has no mutation methods, and publishes every later exact
 committed revision and operation batch without another tracker, value copy, or
-re-diff. Disposing it unregisters only that observation; Pico remains the sole
+re-diff. Disposing it unregisters only that observation; Durable remains the sole
 document mutator.
 
 State and watch acquisition never create; absent lookup returns `undefined`.
@@ -4422,7 +4458,7 @@ Session close ends every state at its seal: the state keeps its last value and
 receives no frame from a commit that settles during close.
 
 Each document state assigns its own in-memory contiguous Chord delivery sequence.
-Pico does not persist or expose that sequence through `WatchHandle`. States and watches retain immutable revisions independently of the loaded tracker
+Durable does not persist or expose that sequence through `WatchHandle`. States and watches retain immutable revisions independently of the loaded tracker
 cache. Reopen creates a new state lifetime and hydration.
 
 Internally, state attachment uses Chord's synchronous atomic snapshot-and-register
@@ -4507,7 +4543,7 @@ type ConversationView = {
 ```
 
 These kinds and their fields are public protocol. Third-party documents are
-exposed through their own Chord services, not mounted.
+exposed through their own Chord objects, not mounted.
 
 The Harness keeps at most one mount per conversation. The first `viewState()`,
 `watch()`, or event attachment builds its revision on the Session line from the
@@ -4632,7 +4668,7 @@ interface AgentEventStream {
 ```
 
 Every event is relative to the `snapshot` and the events before it, never to
-Pico's document layout. `snapshot` replaces everything a consumer holds; every
+Durable's document layout. `snapshot` replaces everything a consumer holds; every
 other event applies on top of it. Attachment captures the snapshot and
 registers for later publications atomically on the Session line.
 
@@ -5277,8 +5313,8 @@ These are contracts, not invitations to add defensive machinery:
 - **Non-cooperative code at close:** close joins every invocation. A task
   handler, tool, or hook that ignores its signal keeps `close()` pending and
   Storage open until it returns; cancelling the close wait does not end it.
-- **Services outliving the Harness:** withdraw Chord services and detach clients
-  before closing the Harness. A state ended by close keeps its last value and
+- **Objects outliving the Harness:** close the Chord objects and links that expose
+  Harness state before closing the Harness. A state ended by close keeps its last value and
   never updates again.
 - **Fatal storage errors:** after a storage error the Session has failed and
   closed itself; reopen it (section 10.1). Retrying the failed call cannot
@@ -5289,7 +5325,7 @@ These are contracts, not invitations to add defensive machinery:
 
 ## 13. Non-goals
 
-Pico5 initially has no:
+Durable has no:
 
 - whole-Session DOM;
 - visible-undurable publication;
@@ -5300,5 +5336,5 @@ Pico5 initially has no:
 - CRDT/offline multi-writer merge;
 - SQL translation of arbitrary Chord operations;
 - JSONL global compaction or automatic corruption repair;
-- compatibility layer for removed Pico prototypes;
+- compatibility layer for earlier harness prototypes;
 - forced termination of non-cooperative extension code inside one process.
