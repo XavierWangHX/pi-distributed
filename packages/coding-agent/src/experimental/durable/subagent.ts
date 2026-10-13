@@ -21,7 +21,7 @@ async function answerText(api: ToolExecutionApi, answer: EntryId, context: Conte
 
 /** What a subagent needs to know about machines: the valid names, and a connection probe for fail-fast. */
 export interface SubagentMachines {
-	/** Target names, checked when the tool runs (the fleet changes at runtime). */
+	/** Target names, checked when the tool runs (the cluster changes at runtime). */
 	names(): string[];
 	/** Connect a machine now so an unreachable one fails the call, not the child's first tool use. */
 	probe(machine: string): Promise<unknown>;
@@ -40,8 +40,11 @@ const Subagents = defineDoc<{ entries: Record<string, { conversation: number; ma
  * its tools pinned to `machine`, and returns the child's answer. Aborting the call aborts the child. The child
  * outlives the call, so the user can switch to it and keep talking. A named child can be continued by a later call:
  * it keeps its machine and its whole context. The model-facing channel is `output`.
+ *
+ * `orchestratorOnly` lists the extensions a child must NOT inherit (machine routing, registration): a subagent is an
+ * executor pinned to its assigned machine; only the orchestrating conversation manages the cluster.
  */
-export function createSubagent(machines: SubagentMachines): Extension {
+export function createSubagent(machines: SubagentMachines, orchestratorOnly: readonly Extension[] = []): Extension {
 	let self: Extension;
 	// eslint-disable-next-line prefer-const
 	self = defineExtension({
@@ -60,7 +63,8 @@ export function createSubagent(machines: SubagentMachines): Extension {
 					}),
 					name: Type.Optional(
 						Type.String({
-							description: 'A short semantic name for this subagent, e.g. "api-research"; registers it for continuation',
+							description:
+								'A short semantic name for this subagent, e.g. "api-research"; registers it for continuation',
 						}),
 					),
 					continue: Type.Optional(
@@ -84,7 +88,10 @@ export function createSubagent(machines: SubagentMachines): Extension {
 						if (args.machine !== undefined) {
 							return {
 								output: [
-									{ type: "text", text: "Do not pass machine when continuing: the subagent keeps its own machine." },
+									{
+										type: "text",
+										text: "Do not pass machine when continuing: the subagent keeps its own machine.",
+									},
 								],
 								isError: true,
 							};
@@ -110,7 +117,10 @@ export function createSubagent(machines: SubagentMachines): Extension {
 						if (args.machine === undefined) {
 							return {
 								output: [
-									{ type: "text", text: "machine is required when creating a subagent (or pass continue for an existing one)." },
+									{
+										type: "text",
+										text: "machine is required when creating a subagent (or pass continue for an existing one).",
+									},
 								],
 								isError: true,
 							};
@@ -133,7 +143,12 @@ export function createSubagent(machines: SubagentMachines): Extension {
 							const doc = await api.snapshot(Subagents, context);
 							if (doc?.entries[args.name] !== undefined) {
 								return {
-									output: [{ type: "text", text: `Name "${args.name}" is already registered; pass continue: "${args.name}" to continue it.` }],
+									output: [
+										{
+											type: "text",
+											text: `Name "${args.name}" is already registered; pass continue: "${args.name}" to continue it.`,
+										},
+									],
 									isError: true,
 								};
 							}
@@ -141,9 +156,11 @@ export function createSubagent(machines: SubagentMachines): Extension {
 						child = await api.commit(async (tx) => {
 							const existing = (await tx.scanConversations({ ownerTaskId: api.taskId }, 1)).items[0];
 							if (existing !== undefined) return existing.id;
-							// Starts as a copy of this conversation's agent; without this extension it cannot delegate further.
+							// Starts as a copy of this conversation's agent, minus what only an orchestrator may do: without
+							// this extension it cannot delegate further, and without the orchestrator-only extensions it
+							// cannot switch machines or manage the cluster — its tools stay pinned to `machine`.
 							const created = await tx.createConversation({ ownership: { kind: "task", taskId: api.taskId } });
-							await configure(tx, created.id, { extensions: { remove: [self] } });
+							await configure(tx, created.id, { extensions: { remove: [self, ...orchestratorOnly] } });
 							(await tx.doc(Machine, created.id)).target = args.machine!;
 							if (args.name !== undefined) {
 								(await tx.doc(Subagents)).entries[args.name] = {
@@ -164,8 +181,7 @@ export function createSubagent(machines: SubagentMachines): Extension {
 					}
 					const text = await answerText(api, settled.answer, context);
 					const label = args.continue ?? args.name;
-					const suffix =
-						label === undefined ? "" : `\n（子代理 "${label}"；续聊传 continue: "${label}"）`;
+					const suffix = label === undefined ? "" : `\n（子代理 "${label}"；续聊传 continue: "${label}"）`;
 					// The model-facing channel is `output` (ToolExecutionResult has no `content` field).
 					return { output: [{ type: "text", text: text + suffix }], details: { conversationId: child } };
 				},
@@ -181,7 +197,9 @@ export function createSubagent(machines: SubagentMachines): Extension {
 						return { output: [{ type: "text", text: "(no named subagents yet; pass name when creating one)" }] };
 					}
 					// The model addresses subagents by name only; ids live in details for the UI.
-					const lines = entries.map(([name, entry]) => `- ${name} (machine ${entry.machine}): ${entry.task.slice(0, 80)}`);
+					const lines = entries.map(
+						([name, entry]) => `- ${name} (machine ${entry.machine}): ${entry.task.slice(0, 80)}`,
+					);
 					return { output: [{ type: "text", text: lines.join("\n") }], details: { entries } };
 				},
 			}),

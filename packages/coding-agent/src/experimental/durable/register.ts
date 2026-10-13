@@ -150,14 +150,15 @@ export class RegisterService {
 			});
 			server.listen(resolved.port, resolved.bind, () => resolve(undefined));
 		});
-		instance = new RegisterService(multienvs, server, resolved);
+		const service = new RegisterService(multienvs, server, resolved);
+		instance = service;
 		if (failure !== undefined) {
-			instance.#unavailable = failure;
+			service.#unavailable = failure;
 		} else {
-			instance.#sweeper = setInterval(() => instance?.#sweep(), 60_000);
-			instance.#sweeper.unref();
+			service.#sweeper = setInterval(() => service.#sweep(), 60_000);
+			service.#sweeper.unref();
 		}
-		return instance;
+		return service;
 	}
 
 	get available(): boolean {
@@ -279,7 +280,10 @@ export class RegisterService {
 				? payload.host
 				: peerIp(request);
 		const port =
-			typeof payload.port === "number" && Number.isInteger(payload.port) && payload.port >= 1 && payload.port <= 65535
+			typeof payload.port === "number" &&
+			Number.isInteger(payload.port) &&
+			payload.port >= 1 &&
+			payload.port <= 65535
 				? payload.port
 				: undefined;
 		if (host === undefined || host === "") {
@@ -289,7 +293,7 @@ export class RegisterService {
 		try {
 			await this.#multienvs.addTarget({
 				name: install.name,
-				kind: "ssh",
+				type: "ssh",
 				host,
 				...(user === undefined ? {} : { user }),
 				...(port === undefined ? {} : { port }),
@@ -399,7 +403,8 @@ log "done: $RESP"
 
 /** The Windows installer: OpenSSH server, admin-wide authorized key, callback. Elevated PowerShell. */
 export function windowsScript({ token, name, callback, publicKey }: ScriptInputs): string {
-	return `# pi-distributed one-shot installer (Windows): OpenSSH server + admin key + registration callback.
+	return (
+		`# pi-distributed one-shot installer (Windows): OpenSSH server + admin key + registration callback.
 $ErrorActionPreference = 'Stop'
 $Token = '${token}'
 $Name = '${name}'
@@ -440,7 +445,8 @@ Write-Host "==> registering as $Name"
 $Body = @{ token = $Token; user = $env:USERNAME; os = 'windows'; arch = $env:PROCESSOR_ARCHITECTURE; hostname = $env:COMPUTERNAME } | ConvertTo-Json -Compress
 $Response = Invoke-RestMethod -Method Post -Uri $Callback -ContentType 'application/json' -Body $Body
 Write-Host "==> done: $($Response | ConvertTo-Json -Compress)"
-`;
+`
+	);
 }
 
 /** The registration extension: one tool that mints install commands for new machines. */
@@ -451,7 +457,7 @@ export function createRegistrar(registrar: RegisterService) {
 			defineTool({
 				name: "create_install_command",
 				description:
-					"Generate the one-line install command for adding a NEW machine to the fleet. " +
+					"Generate the one-line install command for adding a NEW machine to the cluster. " +
 					"The command embeds this machine's SSH public key, a single-use token and the callback URL; " +
 					"the user runs it once on the target (sudo bash / elevated PowerShell). It installs and starts " +
 					"sshd, authorizes the key, and calls back here — the machine is registered immediately and " +

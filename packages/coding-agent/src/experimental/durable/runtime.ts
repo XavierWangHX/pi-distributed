@@ -145,9 +145,11 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const registry = createCodingRegistry(settingsManager, location.cwd);
 		const multienvs = await MultiEnvs.create(PG_URL, location.cwd);
 		const registrar = await RegisterService.create(multienvs);
-		registry.install(createSubagent(multienvs));
-		registry.install(createMultiEnv(multienvs));
-		registry.install(createRegistrar(registrar));
+		// Orchestrator-only extensions: the root conversation routes machines and manages the cluster;
+		// subagent conversations are created without them, pinned to their assigned machine.
+		const orchestratorOnly = [createMultiEnv(multienvs), createRegistrar(registrar)];
+		registry.install(createSubagent(multienvs, orchestratorOnly));
+		for (const extension of orchestratorOnly) registry.install(extension);
 
 		const pendingReports: unknown[] = [];
 		let report: (error: unknown) => void = (error) => pendingReports.push(error);
@@ -277,7 +279,9 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 				const message = entry?.model?.[0];
 				if (message === undefined) return "";
 				const blocks =
-					typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
+					typeof message.content === "string"
+						? [{ type: "text" as const, text: message.content }]
+						: message.content;
 				return blocks
 					.filter((block): block is { type: "text"; text: string } => block.type === "text")
 					.map((block) => block.text)

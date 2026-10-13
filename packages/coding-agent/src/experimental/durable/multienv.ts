@@ -3,32 +3,33 @@
 // switches it; the Harness env callback reads the document and resolves the ExecutionEnv.
 // Targets live in PostgreSQL (pi_machines.targets) — the sole source of truth, shared by every
 // session and immune to local file loss; "local" (this machine) is always available.
+// Snapshots (pi_machines.snapshots) capture docker machines' filesystem state for clone and
+// rollback — the machine timeline, which only the orchestrating conversation may operate.
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { defineDoc, defineExtension, defineTool, section } from "@earendil-works/pi-durable";
 import type { ExecutionEnv } from "@earendil-works/pi-durable/env";
-import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
-import pg from "pg";
-import { Type } from "typebox";
 import {
 	acceptHostKey,
-	connectSsh,
 	Connection,
+	connectSsh,
 	HostKeyUnknownError,
 	LocalExecutionEnv,
+	localDaemon,
 	packagedDaemon,
 	RemoteExecutionEnv,
 	scanHostKey,
 } from "@earendil-works/pi-env";
-import { localDaemon } from "@earendil-works/pi-env";
+import pg from "pg";
+import { Type } from "typebox";
 
 interface RemoteTarget {
 	name: string;
-	kind: "ssh" | "docker";
+	type: "ssh" | "docker";
 	host?: string;
 	user?: string;
 	port?: number;
@@ -37,6 +38,19 @@ interface RemoteTarget {
 	container?: string;
 	daemonPath?: string;
 	trustOnFirstUse?: boolean;
+}
+
+/** A point-in-time capture of a machine's environment, registered in the cluster database. */
+export interface MachineSnapshot {
+	readonly id: string;
+	/** The machine it was taken from; snapshots outlive their machine. */
+	readonly machine: string;
+	/** Which runtime captured it; only docker (`docker commit`) for now. */
+	readonly backend: "docker";
+	/** Backend-specific locator; for docker, the committed local image. */
+	readonly image: string;
+	readonly label?: string;
+	readonly createdAt: number;
 }
 
 const KNOWN_HOSTS = join(homedir(), ".pi", "agent", "multienv-known-hosts");
@@ -78,9 +92,14 @@ async function deployDaemonToContainer(container: string, daemonPath: string): P
 	const binary = packagedDaemon({ platform: "linux", arch: normalized });
 	const bytes = await readFile(binary);
 	const sha256 = createHash("sha256").update(bytes).digest("hex");
-	const present = await run(["docker", "exec", container, "sh", "-c", `sha256sum '${daemonPath}' 2>/dev/null || true`]).catch(
-		() => "",
-	);
+	const present = await run([
+		"docker",
+		"exec",
+		container,
+		"sh",
+		"-c",
+		`sha256sum '${daemonPath}' 2>/dev/null || true`,
+	]).catch(() => "");
 	if (present.includes(sha256)) return;
 	await run(["docker", "cp", binary, `${container}:${daemonPath}`]);
 	await run(["docker", "exec", container, "chmod", "700", daemonPath]);
@@ -102,6 +121,7 @@ export const Machine = defineDoc<{ target: string }>({
 export class MultiEnvs {
 	readonly #defaultCwd: string;
 	readonly #targets = new Map<string, RemoteTarget>();
+	readonly #snapshots = new Map<string, MachineSnapshot>();
 	readonly #localEnvs = new Map<string, LocalExecutionEnv>();
 	#localConnection: Connection | undefined;
 	readonly #remoteEnvs = new Map<string, RemoteExecutionEnv>();
@@ -111,7 +131,7 @@ export class MultiEnvs {
 		this.#defaultCwd = defaultCwd;
 	}
 
-	/** Connect the fleet database, ensure its table, and load every target. */
+	/** Connect the cluster database, ensure its tables, and load every target and snapshot. */
 	static async create(pgUrl: string, defaultCwd: string): Promise<MultiEnvs> {
 		const multienvs = new MultiEnvs(defaultCwd);
 		const client = new pg.Client({ connectionString: pgUrl });
@@ -120,7 +140,7 @@ export class MultiEnvs {
 		await client.query("CREATE SCHEMA IF NOT EXISTS pi_machines");
 		await client.query(`CREATE TABLE IF NOT EXISTS pi_machines.targets (
 			name TEXT PRIMARY KEY,
-			kind TEXT NOT NULL DEFAULT 'ssh' CHECK (kind IN ('ssh', 'docker')),
+			type TEXT NOT NULL DEFAULT 'ssh' CHECK (type IN ('ssh', 'docker')),
 			host TEXT, username TEXT, port INTEGER, cwd TEXT, container TEXT, daemon_path TEXT,
 			trust_on_first_use BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at BIGINT NOT NULL DEFAULT (extract(epoch from now()) * 1000)::bigint,
@@ -128,13 +148,26 @@ export class MultiEnvs {
 		)`);
 		// Databases created before the registration service gained this column.
 		await client.query("ALTER TABLE pi_machines.targets ADD COLUMN IF NOT EXISTS port INTEGER");
+		// Databases created before pi_machines.targets renamed its kind column to type.
+		const legacy = await client.query(
+			"SELECT 1 FROM information_schema.columns WHERE table_schema = 'pi_machines' AND table_name = 'targets' AND column_name = 'kind'",
+		);
+		if ((legacy.rowCount ?? 0) > 0) await client.query("ALTER TABLE pi_machines.targets RENAME COLUMN kind TO type");
+		await client.query(`CREATE TABLE IF NOT EXISTS pi_machines.snapshots (
+			id TEXT PRIMARY KEY,
+			machine TEXT NOT NULL,
+			backend TEXT NOT NULL,
+			image TEXT NOT NULL,
+			label TEXT,
+			created_at BIGINT NOT NULL
+		)`);
 		const rows = await client.query(
-			"SELECT name, kind, host, username, port, cwd, container, daemon_path, trust_on_first_use FROM pi_machines.targets",
+			"SELECT name, type, host, username, port, cwd, container, daemon_path, trust_on_first_use FROM pi_machines.targets",
 		);
 		for (const row of rows.rows) {
 			multienvs.#targets.set(row.name as string, {
 				name: row.name as string,
-				kind: row.kind as "ssh" | "docker",
+				type: row.type as "ssh" | "docker",
 				host: row.host ?? undefined,
 				user: row.username ?? undefined,
 				port: row.port ?? undefined,
@@ -144,6 +177,19 @@ export class MultiEnvs {
 				trustOnFirstUse: row.trust_on_first_use ?? true,
 			});
 		}
+		const snapshots = await client.query(
+			"SELECT id, machine, backend, image, label, created_at FROM pi_machines.snapshots",
+		);
+		for (const row of snapshots.rows) {
+			multienvs.#snapshots.set(row.id as string, {
+				id: row.id as string,
+				machine: row.machine as string,
+				backend: row.backend as "docker",
+				image: row.image as string,
+				...(row.label === null ? {} : { label: row.label as string }),
+				createdAt: Number(row.created_at),
+			});
+		}
 		return multienvs;
 	}
 
@@ -151,15 +197,15 @@ export class MultiEnvs {
 	async addTarget(target: RemoteTarget): Promise<void> {
 		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
 		await this.#pg.query(
-			`INSERT INTO pi_machines.targets (name, kind, host, username, port, cwd, container, daemon_path, trust_on_first_use)
+			`INSERT INTO pi_machines.targets (name, type, host, username, port, cwd, container, daemon_path, trust_on_first_use)
 			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			 ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, host = excluded.host,
+			 ON CONFLICT (name) DO UPDATE SET type = excluded.type, host = excluded.host,
 				username = excluded.username, port = excluded.port, cwd = excluded.cwd, container = excluded.container,
 				daemon_path = excluded.daemon_path, trust_on_first_use = excluded.trust_on_first_use,
 				last_registered = (extract(epoch from now()) * 1000)::bigint`,
 			[
 				target.name,
-				target.kind,
+				target.type,
 				target.host ?? null,
 				target.user ?? null,
 				target.port ?? null,
@@ -177,14 +223,18 @@ export class MultiEnvs {
 		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
 		await this.#pg.query("DELETE FROM pi_machines.targets WHERE name = $1", [name]);
 		this.#targets.delete(name);
-		const cached = this.#remoteEnvs.get(name);
-		if (cached !== undefined) {
-			this.#remoteEnvs.delete(name);
-			await cached.cleanup(BACKGROUND_CONTEXT).catch(() => undefined);
-		}
+		await this.discardEnv(name);
 	}
 
-	/** The registered target's record, for tools that manage the fleet. */
+	/** Drop the cached environment of a machine whose runtime was replaced (rollback); the next envFor reconnects. */
+	async discardEnv(name: string): Promise<void> {
+		const cached = this.#remoteEnvs.get(name);
+		if (cached === undefined) return;
+		this.#remoteEnvs.delete(name);
+		await cached.cleanup(BACKGROUND_CONTEXT).catch(() => undefined);
+	}
+
+	/** The registered target's record, for tools that manage the cluster. */
 	target(name: string): RemoteTarget | undefined {
 		return this.#targets.get(name);
 	}
@@ -196,13 +246,108 @@ export class MultiEnvs {
 	describeTargets(): string {
 		const rows = ["local (this machine)"];
 		for (const target of this.#targets.values()) {
-			const address = `${target.host ?? "?"}${target.port !== undefined ? `:${target.port}` : ""}`;
-			rows.push(`${target.name} (${address}${target.user ? `, user ${target.user}` : ""})`);
+			rows.push(
+				target.type === "docker"
+					? `${target.name} (docker container)`
+					: `${target.name} (${target.host ?? "?"}${target.port !== undefined ? `:${target.port}` : ""}${
+							target.user ? `, user ${target.user}` : ""
+						})`,
+			);
 		}
 		return rows.join("; ");
 	}
 
+	/** The registered snapshot, by id. */
+	snapshot(id: string): MachineSnapshot | undefined {
+		return this.#snapshots.get(id);
+	}
+
+	/** Every snapshot, oldest first. */
+	snapshots(): MachineSnapshot[] {
+		return [...this.#snapshots.values()].sort((a, b) => a.createdAt - b.createdAt);
+	}
+
+	describeSnapshots(): string {
+		const snapshots = this.snapshots();
+		if (snapshots.length === 0) return "(none)";
+		return snapshots
+			.map(
+				(snapshot) =>
+					`${snapshot.id} (of ${snapshot.machine}, ${snapshot.backend}${
+						snapshot.label === undefined ? "" : `, "${snapshot.label}"`
+					})`,
+			)
+			.join("; ");
+	}
+
+	/**
+	 * Capture a docker machine's filesystem state: `docker commit` the container into a local snapshot image and
+	 * register it durably. Processes and memory are NOT captured — the fallback until a micro-VM backend brings
+	 * O(1) snapshots; services must be restarted after a restore.
+	 */
+	async snapshotMachine(name: string, label?: string): Promise<MachineSnapshot> {
+		const target = this.#dockerTarget(name);
+		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
+		const id = `snap-${randomBytes(4).toString("hex")}`;
+		const image = `pi-snapshot:${id}`;
+		await run(["docker", "commit", target.container ?? name, image]);
+		const snapshot: MachineSnapshot = {
+			id,
+			machine: name,
+			backend: "docker",
+			image,
+			createdAt: Date.now(),
+			...(label === undefined ? {} : { label }),
+		};
+		await this.#pg.query(
+			"INSERT INTO pi_machines.snapshots (id, machine, backend, image, label, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+			[snapshot.id, snapshot.machine, snapshot.backend, snapshot.image, snapshot.label ?? null, snapshot.createdAt],
+		);
+		this.#snapshots.set(id, snapshot);
+		return snapshot;
+	}
+
+	/**
+	 * Roll a docker machine back to a snapshot: recreate its container from the snapshot image, discard the stale
+	 * cached environment, and redeploy the daemon (fail fast). The machine's environment timeline moves back to the
+	 * snapshot; on failure the recreated container stays up for debugging.
+	 */
+	async rollbackMachine(name: string, snapshotId: string): Promise<MachineSnapshot> {
+		const target = this.#dockerTarget(name);
+		const snapshot = this.#snapshots.get(snapshotId);
+		if (snapshot === undefined) throw new Error(`Unknown snapshot "${snapshotId}"`);
+		const container = target.container ?? name;
+		await run(["docker", "rm", "-f", container]).catch(() => undefined);
+		await run(["docker", "run", "-d", "--name", container, snapshot.image, "sleep", "infinity"]);
+		await this.discardEnv(name);
+		await this.envFor(name); // Redeploy and verify the daemon now.
+		return snapshot;
+	}
+
+	/** Delete a snapshot registration durably; its docker image goes with it. */
+	async removeSnapshot(id: string): Promise<void> {
+		if (this.#pg === undefined) throw new Error("MultiEnvs is closed");
+		const snapshot = this.#snapshots.get(id);
+		if (snapshot === undefined) return;
+		await this.#pg.query("DELETE FROM pi_machines.snapshots WHERE id = $1", [id]);
+		this.#snapshots.delete(id);
+		await run(["docker", "rmi", "-f", snapshot.image]).catch(() => undefined);
+	}
+
+	#dockerTarget(name: string): RemoteTarget {
+		const target = this.#targets.get(name);
+		if (target === undefined) throw new Error(`Unknown machine "${name}"`);
+		if (target.type !== "docker") {
+			throw new Error(
+				`Machine "${name}" is ${target.type}; snapshots and rollback need a docker machine ` +
+					`(O(1) snapshots arrive with the micro-VM backend)`,
+			);
+		}
+		return target;
+	}
+
 	#sshTargetOf(target: RemoteTarget) {
+		if (target.host === undefined) throw new Error(`SSH machine "${target.name}" has no host`);
 		return {
 			host: target.host,
 			user: target.user,
@@ -230,7 +375,7 @@ export class MultiEnvs {
 		const cached = this.#remoteEnvs.get(name);
 		if (cached) return cached;
 		const target = this.#targets.get(name)!;
-		if (target.kind === "docker") {
+		if (target.type === "docker") {
 			const container = target.container ?? target.name;
 			const daemonPath = target.daemonPath ?? DEFAULT_DAEMON_PATH;
 			await deployDaemonToContainer(container, daemonPath);
@@ -306,7 +451,8 @@ export class MultiEnvs {
 export function createMultiEnv(multienvs: MultiEnvs) {
 	const machineName = (name: string): string => {
 		if (name === "local") throw new Error('"local" is reserved for this machine');
-		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name)) throw new Error(`Invalid machine name: ${JSON.stringify(name)}`);
+		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name))
+			throw new Error(`Invalid machine name: ${JSON.stringify(name)}`);
 		return name;
 	};
 	const knownMachine = (name: string): string => {
@@ -317,6 +463,18 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 			);
 		}
 		return name;
+	};
+	const requireSnapshot = (id: string): MachineSnapshot => {
+		const snapshot = multienvs.snapshot(id);
+		if (snapshot === undefined) {
+			const known = multienvs.snapshots().map((entry) => entry.id);
+			throw new Error(
+				`Unknown snapshot "${id}". Known: ${
+					known.length > 0 ? known.join(", ") : "(none yet; take one with snapshot_machine)"
+				}.`,
+			);
+		}
+		return snapshot;
 	};
 	return defineExtension({
 		name: "multi-env",
@@ -339,7 +497,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 					await api.commit(async (tx) => {
 						(await tx.doc(Machine, api.conversationId)).target = name;
 					}, context);
-					const kind = multienvs.target(name)?.kind;
+					const type = multienvs.target(name)?.type;
 					return {
 						output: [
 							{
@@ -348,7 +506,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 									`Switched to ${name}. ` +
 									(name === "local"
 										? "read/write/edit/bash now run on this machine."
-										: kind === "docker"
+										: type === "docker"
 											? `read/write/edit/bash now run inside the ${name} container (Linux paths).`
 											: `read/write/edit/bash now run on ${name}; check the machines section for its platform conventions.`),
 							},
@@ -359,8 +517,9 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 			defineTool({
 				name: "create_machine",
 				description:
-					`Create a docker container on THIS machine and add it to the fleet as a sandbox. ` +
+					`Create a docker container on THIS machine and add it to the cluster as a sandbox. ` +
 					`Use it to isolate untrusted work, or to run parallel subagents each in its own container. ` +
+					`Pass from_snapshot to clone a machine from a snapshot (e.g. one rollout per clone). ` +
 					`The pi-env daemon is deployed into the container automatically; the container is ready ` +
 					`for use_machine and subagent(machine=...) when this returns.`,
 				parameters: Type.Object({
@@ -368,11 +527,21 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 					image: Type.Optional(
 						Type.String({ description: `Container image (default ${DEFAULT_CONTAINER_IMAGE})` }),
 					),
+					from_snapshot: Type.Optional(
+						Type.String({
+							description:
+								"Snapshot id to clone the machine from (the machines section lists them); pass either this or image",
+						}),
+					),
 				}),
 				async execute(args) {
 					const name = machineName(args.name);
 					knownMachineOrFree(name);
-					const image = args.image ?? DEFAULT_CONTAINER_IMAGE;
+					let image = args.image ?? DEFAULT_CONTAINER_IMAGE;
+					if (args.from_snapshot !== undefined) {
+						if (args.image !== undefined) throw new Error("Pass either image or from_snapshot, not both.");
+						image = requireSnapshot(args.from_snapshot).image;
+					}
 					try {
 						await run(["docker", "run", "-d", "--name", name, image, "sleep", "infinity"]);
 					} catch (error) {
@@ -380,7 +549,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 					}
 					await multienvs.addTarget({
 						name,
-						kind: "docker",
+						type: "docker",
 						container: name,
 						daemonPath: DEFAULT_DAEMON_PATH,
 						cwd: "/",
@@ -397,7 +566,8 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 							{
 								type: "text",
 								text:
-									`Created machine "${name}" (docker container from ${image}). ` +
+									`Created machine "${name}" (docker container from ${image}` +
+									`${args.from_snapshot === undefined ? "" : `, snapshot ${args.from_snapshot}`}). ` +
 									`Switch to it with use_machine("${name}"), or hand it to a subagent with machine: "${name}". ` +
 									`Destroy it with destroy_machine("${name}") when done.`,
 							},
@@ -412,9 +582,9 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 			defineTool({
 				name: "destroy_machine",
 				description:
-					`Remove a machine from the fleet. A docker sandbox's container is deleted; an SSH machine ` +
-					`is only unregistered (the machine itself is untouched). Conversations currently on it ` +
-					`fall back to local.`,
+					`Remove a machine from the cluster. A docker sandbox's container is deleted; an SSH machine ` +
+					`is only unregistered (the machine itself is untouched). Snapshots of it survive and can still ` +
+					`be cloned. Conversations currently on it fall back to local.`,
 				parameters: Type.Object({
 					name: Type.String({ description: "Name of the machine to remove" }),
 				}),
@@ -423,7 +593,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 					if (name === "local") throw new Error("The local machine cannot be destroyed");
 					const target = multienvs.target(name);
 					if (target === undefined) throw new Error(`Unknown machine "${name}"`);
-					if (target.kind === "docker") {
+					if (target.type === "docker") {
 						await run(["docker", "rm", "-f", target.container ?? name]).catch(() => undefined);
 					}
 					await multienvs.removeTarget(name);
@@ -432,7 +602,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 							{
 								type: "text",
 								text:
-									target.kind === "docker"
+									target.type === "docker"
 										? `Destroyed machine "${name}" (container removed).`
 										: `Unregistered machine "${name}" (the machine itself is untouched).`,
 							},
@@ -441,15 +611,87 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 				},
 			}),
 			defineTool({
+				name: "snapshot_machine",
+				description:
+					`Capture a docker machine's filesystem state as a snapshot registered in the cluster database. ` +
+					`Snapshots outlive the machine: clone one into a new machine with create_machine(from_snapshot=...), ` +
+					`or restore it in place with rollback_machine. Running processes and memory are NOT captured ` +
+					`(docker commit fallback); restart services after a restore.`,
+				parameters: Type.Object({
+					machine: Type.String({ description: 'Name of the docker machine to snapshot, e.g. "sbx-1"' }),
+					label: Type.Optional(
+						Type.String({ description: 'Optional human label, e.g. "golden env" or "before refactor"' }),
+					),
+				}),
+				async execute(args) {
+					if (args.machine === "local")
+						throw new Error("The local machine cannot be snapshotted (no virtualization layer)");
+					knownMachine(args.machine);
+					let snapshot: MachineSnapshot;
+					try {
+						snapshot = await multienvs.snapshotMachine(args.machine, args.label);
+					} catch (error) {
+						throw new Error(withDockerHint(error));
+					}
+					return {
+						output: [
+							{
+								type: "text",
+								text:
+									`Snapshot ${snapshot.id} of machine "${args.machine}" registered` +
+									`${snapshot.label === undefined ? "" : ` with label "${snapshot.label}"`}. ` +
+									`Clone it with create_machine(from_snapshot: "${snapshot.id}"), or restore it in place ` +
+									`with rollback_machine(machine: "${args.machine}", snapshot: "${snapshot.id}").`,
+							},
+						],
+					};
+				},
+			}),
+			defineTool({
+				name: "rollback_machine",
+				description:
+					`Roll a docker machine's filesystem back to a snapshot: its container is recreated from the ` +
+					`snapshot image. Everything created or changed after the snapshot is gone, and running processes ` +
+					`are not restored. The machine's timeline moves back while conversation transcripts do not: ` +
+					`when continuing a conversation that used this machine, tell it the environment was rewound ` +
+					`(or start a fresh subagent on it).`,
+				parameters: Type.Object({
+					machine: Type.String({ description: "Name of the docker machine to roll back" }),
+					snapshot: Type.String({ description: 'Snapshot id to restore, e.g. "snap-1a2b3c4d"' }),
+				}),
+				async execute(args) {
+					knownMachine(args.machine);
+					const restored = requireSnapshot(args.snapshot);
+					try {
+						await multienvs.rollbackMachine(args.machine, restored.id);
+					} catch (error) {
+						throw new Error(withDockerHint(error));
+					}
+					return {
+						output: [
+							{
+								type: "text",
+								text:
+									`Machine "${args.machine}" rolled back to ${restored.id} ` +
+									`(taken ${new Date(restored.createdAt).toISOString()}` +
+									`${restored.label === undefined ? "" : `, "${restored.label}"`}). ` +
+									`Its environment timeline is now at that point; observations made after it no longer ` +
+									`match the environment — say so explicitly when continuing a conversation that used this machine.`,
+							},
+						],
+					};
+				},
+			}),
+			defineTool({
 				name: "list_machines",
-				description: "List the fleet: every machine this conversation can run tools on, with kind and address.",
+				description: "List the cluster: every machine this conversation can run tools on, with type and address.",
 				parameters: Type.Object({}),
 				async execute() {
 					const lines: string[] = ["local (this machine)"];
 					for (const name of multienvs.names()) {
 						if (name === "local") continue;
 						const target = multienvs.target(name)!;
-						if (target.kind === "docker") {
+						if (target.type === "docker") {
 							const status = await run([
 								"docker",
 								"inspect",
@@ -473,7 +715,8 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 				const current = doc?.target ?? "local";
 				return (
 					`You can operate several machines; read/write/edit/bash run on the conversation's current ` +
-					`machine (${current}). Switch with use_machine. Available: ${multienvs.describeTargets()}.`
+					`machine (${current}). Switch with use_machine. Available: ${multienvs.describeTargets()}. ` +
+					`Snapshots: ${multienvs.describeSnapshots()}.`
 				);
 			}),
 		],

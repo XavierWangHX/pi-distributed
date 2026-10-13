@@ -19,14 +19,20 @@ if (!registrar.available) process.exit(1);
 
 const name = `smoke-${Date.now().toString(36)}`;
 const install = await registrar.mint(name, "linux");
-check("mint returns curl one-liner", install.command.startsWith("curl -fsSL") && install.command.includes(install.token));
+check(
+	"mint returns curl one-liner",
+	install.command.startsWith("curl -fsSL") && install.command.includes(install.token),
+);
 
 const scriptResponse = await fetch(`${registrar.baseUrl}/install/linux.sh?token=${install.token}`);
 const script = await scriptResponse.text();
 check("script served", scriptResponse.status === 200);
 check("script embeds token", script.includes(install.token));
 check("script embeds callback", script.includes(`${registrar.baseUrl}/register`));
-check("script embeds a public key", /^PUBKEY='ssh-[A-Za-z0-9+/= ]+'/m.test(script) || /^PUBKEY='[a-z0-9-]+ [A-Za-z0-9+/=]+'/m.test(script));
+check(
+	"script embeds a public key",
+	/^PUBKEY='ssh-[A-Za-z0-9+/= ]+'/m.test(script) || /^PUBKEY='[a-z0-9-]+ [A-Za-z0-9+/=]+'/m.test(script),
+);
 check("script installs sshd", script.includes("openssh-server"));
 check("script writes authorized_keys", script.includes("authorized_keys"));
 
@@ -37,11 +43,19 @@ check("unknown token cannot fetch script", badScript.status === 404);
 const registerResponse = await fetch(`${registrar.baseUrl}/register`, {
 	method: "POST",
 	headers: { "content-type": "application/json" },
-	body: JSON.stringify({ token: install.token, user: "smokeuser", os: "linux", arch: "x86_64", hostname: "smokebox", host: "203.0.113.7", port: 2222 }),
+	body: JSON.stringify({
+		token: install.token,
+		user: "smokeuser",
+		os: "linux",
+		arch: "x86_64",
+		hostname: "smokebox",
+		host: "203.0.113.7",
+		port: 2222,
+	}),
 });
 const registered = (await registerResponse.json()) as Record<string, unknown>;
 check("register accepted", registerResponse.status === 200 && registered.ok === true, JSON.stringify(registered));
-check("in-memory fleet updated", multienvs.names().includes(name));
+check("in-memory cluster updated", multienvs.names().includes(name));
 check("describe shows host:port and user", multienvs.describeTargets().includes("203.0.113.7:2222"));
 
 const reloaded = await MultiEnvs.create(PG_URL, process.cwd());
