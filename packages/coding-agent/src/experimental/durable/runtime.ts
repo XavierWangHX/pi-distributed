@@ -24,6 +24,7 @@ import {
 	findInitialAgentModel,
 } from "./harness-setup.ts";
 import { createMultiEnv, MultiEnvs } from "./multienv.ts";
+import { createRegistrar, RegisterService } from "./register.ts";
 import { selectSession } from "./sessions.ts";
 import { createSubagent } from "./subagent.ts";
 
@@ -140,8 +141,10 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const settings = createHarnessSettings(settingsManager);
 		const registry = createCodingRegistry(settingsManager, location.cwd);
 		const multienvs = await MultiEnvs.create(PG_URL, location.cwd);
+		const registrar = await RegisterService.create(multienvs);
 		registry.install(createSubagent(multienvs));
 		registry.install(createMultiEnv(multienvs));
+		registry.install(createRegistrar(registrar));
 
 		const pendingReports: unknown[] = [];
 		let report: (error: unknown) => void = (error) => pendingReports.push(error);
@@ -361,6 +364,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 					try {
 						// Close writes no outcome: a running turn resumes with --continue.
 						await opened.close(context);
+						await registrar.stop();
 						await multienvs.cleanup();
 					} finally {
 						await location.release();

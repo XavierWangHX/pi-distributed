@@ -21,7 +21,7 @@ async function answerText(api: ToolExecutionApi, answer: EntryId, context: Conte
 
 /** What a subagent needs to know about machines: the valid names, and a connection probe for fail-fast. */
 export interface SubagentMachines {
-	/** Target names for the tool's schema, evaluated when the extension is created. */
+	/** Target names, checked when the tool runs (the fleet changes at runtime). */
 	names(): string[];
 	/** Connect a machine now so an unreachable one fails the call, not the child's first tool use. */
 	probe(machine: string): Promise<unknown>;
@@ -70,8 +70,9 @@ export function createSubagent(machines: SubagentMachines): Extension {
 						}),
 					),
 					machine: Type.Optional(
-						Type.Union(machines.names().map((name) => Type.Literal(name)), {
-							description: "Machine the new subagent's tools execute on (required unless continuing)",
+						Type.String({
+							description:
+								"Machine the new subagent's tools execute on (required unless continuing); the machines section lists available names",
 						}),
 					),
 				}),
@@ -110,6 +111,19 @@ export function createSubagent(machines: SubagentMachines): Extension {
 							return {
 								output: [
 									{ type: "text", text: "machine is required when creating a subagent (or pass continue for an existing one)." },
+								],
+								isError: true,
+							};
+						}
+						if (!machines.names().includes(args.machine)) {
+							return {
+								output: [
+									{
+										type: "text",
+										text:
+											`Unknown machine "${args.machine}". Known: ${machines.names().join(", ")}. ` +
+											`Add one with create_machine (docker sandbox) or create_install_command (physical/VM machine).`,
+									},
 								],
 								isError: true,
 							};

@@ -12,6 +12,7 @@ import {
 	findInitialAgentModel,
 } from "./harness-setup.ts";
 import { createMultiEnv, MultiEnvs } from "./multienv.ts";
+import { createRegistrar, RegisterService } from "./register.ts";
 import { createSubagent } from "./subagent.ts";
 
 const cwd = process.cwd();
@@ -21,8 +22,10 @@ const settingsManager = SettingsManager.create(cwd);
 configureHarnessHttp(settingsManager);
 const registry = createCodingRegistry(settingsManager, cwd);
 const multienvs = await MultiEnvs.create(PG_URL, cwd);
+const registrar = await RegisterService.create(multienvs);
 registry.install(createSubagent(multienvs));
 registry.install(createMultiEnv(multienvs));
+registry.install(createRegistrar(registrar));
 
 const db = `pi_ask_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
 const harness = await Harness.open(await openPgStorage(PG_URL, { schema: db }), {
@@ -59,5 +62,6 @@ if (settled.status === "done" && settled.type === "input") {
 	console.error("did not complete:", JSON.stringify(settled).slice(0, 500));
 }
 await harness.close(BACKGROUND_CONTEXT);
+await registrar.stop();
 await multienvs.cleanup();
 process.exit(0);
