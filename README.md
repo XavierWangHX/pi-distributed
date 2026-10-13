@@ -3,6 +3,27 @@
 **一个大脑，多双手 —— earendil-works/pi 的分布式扩展分支。**
 *One brain, many hands: a fork of [earendil-works/pi](https://github.com/earendil-works/pi) that keeps and extends the durable-agent demo upstream deleted — multi-machine execution environments, PostgreSQL-backed sessions and fleet registry, machine-pinned subagents.*
 
+## 我们做的事：三个平面完全解耦
+
+| 平面 | 是什么 | 在哪儿跑 |
+|---|---|---|
+| **大脑** | LLM + agent loop（`Harness` SDK） | 任意一处：本机、容器、服务器 |
+| **手脚** | 工具执行环境 + 文件系统（ExecutionEnv） | 任意多台：本机 `local`、SSH 远端、docker（预留） |
+| **会话记录** | durable 会话存储（Storage 接口） | 任意后端：PostgreSQL（本仓库新增）/ sqlite / jsonl / memory |
+
+三者只通过两个接缝相连：Harness 的 **env 回调**（按会话读 `machine` 文档，决定这轮工具落在哪台机器）和 **Storage 接口**（一次提交一个事务）。解耦的直接后果：`use_machine` 切换后，原生 `read`/`write`/`edit`/`bash` 一行未改就跑在选中的机器上；大脑进程崩了，会话从 PG 重放续跑，什么都不丢。
+
+三个平面各自独立扩缩，因此天然支持大规模分布式：
+
+- **大脑**是无状态进程（状态全在 PG）——可水平复制、容器化、接队列调度；
+- **手脚**是动态舰队（`pi_machines.targets` 表，PG 唯一事实源）——随时增删机器，多实例共享同一张舰队表，未知 target 回落 `local`；
+- **会话**集中存储——崩溃恢复、多实例并发、跨会话审计都是免费的。
+
+### 适用场景
+
+1. **设备与算力池管理**：一个 agent 管理多台设备与 GPU 服务器，自由调度算力——对话中 `use_machine` 切换执行机；`subagent(task, machine=...)` 把任务并行派到不同机器（已实测双机并行）；机器清单动态注册进舰队表。
+2. **Eval Harness / RL 训练底座**：主 agent 自主启动多个 subagent + 沙箱对，进行 rollout 或 eval——每个 subagent 是独立的 durable 会话、创建即锁定运行环境、全程可回放可归因；无头 SDK（`Harness.open → submit → wait`）让编排器把整个 fleet 当函数调用。docker 沙箱（`kind: "docker"`）为此预留。
+
 ## 与官方 pi 的关系
 
 - **这是pi的分布式实验分支，不是替代**。本仓库唯一目的是承载官方仓库里不存在的分布式实验；CLI 能力、包结构、API 与上游保持一致，`main` 分支定期 `git merge` 上游 `main` 跟进。
