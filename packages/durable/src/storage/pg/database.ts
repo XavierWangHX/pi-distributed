@@ -15,13 +15,8 @@ function placeholders(sql: string): string {
 /** Attach the statement and parameter types to a query failure, for diagnostics. */
 function tagQuery(error: unknown, sql: string, params: readonly PgValue[]): Error {
 	if (!(error instanceof Error)) return new Error(String(error));
-	return new Error(
-		`${error.message} [sql: ${sql}] [params: ${params.map((p) => JSON.stringify(p)).join(", ")}]`,
-	);
+	return new Error(`${error.message} [sql: ${sql}] [params: ${params.map((p) => JSON.stringify(p)).join(", ")}]`);
 }
-
-/** A queue entry's operation. */
-type Operation = () => Promise<unknown>;
 
 /**
  * `SqliteDatabase` over one node-postgres client: the PostgreSQL adapter of the portable storage core.
@@ -62,22 +57,18 @@ export class PgDatabase {
 
 	async get<T extends object>(sql: string, ...params: PgValue[]): Promise<T | undefined> {
 		return this.#schedule(async () => {
-			const result = await this.#client
-				.query<T>(placeholders(sql), params)
-				.catch((error: unknown) => {
-					throw tagQuery(error, sql, params);
-				});
+			const result = await this.#client.query<T>(placeholders(sql), params).catch((error: unknown) => {
+				throw tagQuery(error, sql, params);
+			});
 			return result.rows[0];
 		});
 	}
 
 	async all<T extends object>(sql: string, ...params: PgValue[]): Promise<T[]> {
 		return this.#schedule(async () => {
-			const result = await this.#client
-				.query<T>(placeholders(sql), params)
-				.catch((error: unknown) => {
-					throw tagQuery(error, sql, params);
-				});
+			const result = await this.#client.query<T>(placeholders(sql), params).catch((error: unknown) => {
+				throw tagQuery(error, sql, params);
+			});
 			return result.rows;
 		});
 	}

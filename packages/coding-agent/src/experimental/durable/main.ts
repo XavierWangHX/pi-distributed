@@ -35,9 +35,7 @@ async function readPipedStdin(): Promise<string | undefined> {
 
 const options = parseArgs(process.argv.slice(2));
 const stdinContent = await readPipedStdin();
-const initial = [stdinContent, options.messages[0]]
-	.filter((part): part is string => part !== undefined)
-	.join("");
+const initial = [stdinContent, options.messages[0]].filter((part): part is string => part !== undefined).join("");
 // Official trigger: -p, or stdin/stdout not attached to a terminal.
 const printMode = options.print || stdinContent !== undefined || process.stdout.isTTY === false;
 

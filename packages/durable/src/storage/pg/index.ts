@@ -2,7 +2,7 @@ import { SqliteStorage } from "../sqlite/storage.ts";
 import { connectPg, PgDatabase } from "./database.ts";
 import { applyPgMigrations } from "./migrations.ts";
 
-export { PgDatabase, connectPg } from "./database.ts";
+export { connectPg, PgDatabase } from "./database.ts";
 export { applyPgMigrations, PG_MIGRATIONS } from "./migrations.ts";
 
 export interface OpenPgStorageOptions {
@@ -18,12 +18,15 @@ export interface OpenPgStorageOptions {
  * SQLite backend; `connectionString` is anything node-postgres accepts. The storage is single-writer like every
  * durable storage: one process owns it at a time, and PostgreSQL enforces the rest.
  */
-export async function openPgStorage(connectionString: string, options: OpenPgStorageOptions = {}): Promise<SqliteStorage> {
+export async function openPgStorage(
+	connectionString: string,
+	options: OpenPgStorageOptions = {},
+): Promise<SqliteStorage> {
 	const client = await connectPg(connectionString);
 	try {
 		if (options.schema !== undefined) {
-			await client.query("CREATE SCHEMA IF NOT EXISTS " + quoteIdent(options.schema));
-			await client.query("SET search_path TO " + quoteIdent(options.schema));
+			await client.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdent(options.schema)}`);
+			await client.query(`SET search_path TO ${quoteIdent(options.schema)}`);
 		}
 		return await SqliteStorage.open(new PgDatabase(client), { migrate: applyPgMigrations });
 	} catch (error) {

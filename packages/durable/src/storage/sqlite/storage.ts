@@ -841,7 +841,11 @@ export class SqliteStorage implements Storage {
 	}
 
 	private async claimId(executor: SqliteExecutor, id: Id<string>, table: TableName): Promise<void> {
-		await executor.run("INSERT INTO record_ids (id, record_type) VALUES (?, ?) ON CONFLICT (id) DO NOTHING", id, table);
+		await executor.run(
+			"INSERT INTO record_ids (id, record_type) VALUES (?, ?) ON CONFLICT (id) DO NOTHING",
+			id,
+			table,
+		);
 	}
 
 	private async applyDocumentActions(
