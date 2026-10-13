@@ -3,6 +3,31 @@
 **一个大脑，多双手 —— earendil-works/pi 的分布式扩展分支。**
 *One brain, many hands: a fork of [earendil-works/pi](https://github.com/earendil-works/pi) that keeps and extends the durable-agent demo upstream deleted — multi-machine execution environments, PostgreSQL-backed sessions and fleet registry, machine-pinned subagents.*
 
+## 架构
+
+```
+            ┌──────────────────────────────┐
+            │           PostgreSQL          │
+            │     会话记录 + 机器舰队        │
+            │    (Storage · 事务提交)       │
+            └──────────────┬───────────────┘
+                           │ 一次提交一个事务，崩溃后重放
+            ┌──────────────┴───────────────┐
+            │       大脑（LLM 机器）        │
+            │   agent loop · Harness SDK    │
+            │   状态全在 PG · 可水平复制     │
+            └─┬────────────────────────┬───┘
+              │                        │   env 回调（会话级 machine 路由）
+              │                        │
+   物理机 / GPU 集群 · SSH 容器集群 · docker（预留）
+     ┌───┐  ┌───┐  ┌───┐      ┌───┐  ┌───┐  ┌───┐
+     │gpu│  │gpu│  │… │      │sbx│  │sbx│  │… │
+     └───┘  └───┘  └───┘      └───┘  └───┘  └───┘
+    pi-env 手脚 · 动态注册    subagent 沙箱对（预留）
+```
+
+> 大脑所在的机器同时是默认手脚（`local`）；`use_machine` / `subagent(machine=...)` 决定 env 回调把工具执行落到哪台机器，机器清单和全部会话记录都在 PG。
+
 ## 我们做的事：三个平面完全解耦
 
 | 平面 | 是什么 | 在哪儿跑 |
