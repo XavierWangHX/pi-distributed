@@ -3,6 +3,7 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
 	type AgentState,
+	AssistantEntry,
 	type Conversation,
 	type ConversationId,
 	type ConversationView,
@@ -73,6 +74,8 @@ export interface DurableViewSource {
 export interface DurableController {
 	/** Prompt when idle; otherwise steer or queue a follow-up. */
 	submit(text: string, whenBusy: "steer" | "followUp"): Promise<void>;
+	/** One headless round: submit, wait for the answer, return its text. Throws when unanswered. */
+	ask(text: string): Promise<string>;
 	compact(instructions: string | undefined): Promise<void>;
 	abort(): Promise<void>;
 	cycleThinking(): Promise<void>;
@@ -263,6 +266,23 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const controller: DurableController = {
 			submit: (text, whenBusy) =>
 				command(async () => watchAnswer(await current.submit({ type: "input", content: text, whenBusy }, context))),
+			ask: async (text) => {
+				const submission = await current.submit({ type: "input", content: text }, context);
+				const settled = await submission.wait(context);
+				if (settled.status !== "done" || settled.type !== "input") {
+					const reason = settled.status === "unanswered" ? `: ${settled.reason}` : "";
+					throw new Error(`No answer (${settled.status})${reason}`);
+				}
+				const entry = await opened.commit((tx) => tx.entry(AssistantEntry, settled.answer), context);
+				const message = entry?.model?.[0];
+				if (message === undefined) return "";
+				const blocks =
+					typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
+				return blocks
+					.filter((block): block is { type: "text"; text: string } => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+			},
 			compact: (instructions) =>
 				command(async () => {
 					const id = await current.compact(instructions, context);

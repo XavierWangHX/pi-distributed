@@ -80,6 +80,8 @@ npm install
 node packages/coding-agent/src/experimental/durable/main.ts
 ```
 
+无头一轮（和官方 `-p` 同格式，也吃管道 stdin）：`node packages/coding-agent/src/experimental/durable/main.ts -p "你的问题"`；会话照样落 PG，事后可查。
+
 起来就能用——`local`（本机）开箱即有。加远端机器：对话里让 agent 调 `create_install_command`，把它生成的一条命令拿到目标机上跑（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机会自己装好 sshd、写好公钥并注册回来。加沙箱：让 agent `create_machine` 就行。
 
 ---
