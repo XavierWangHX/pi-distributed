@@ -9,8 +9,6 @@ import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir, networkInterfaces } from "node:os";
 import { join } from "node:path";
-import { defineExtension, defineTool } from "@earendil-works/pi-durable";
-import { Type } from "typebox";
 import type { MultiEnvs } from "./multienv.ts";
 
 const DEFAULT_PORT = Number(process.env.PI_REGISTER_PORT ?? 8737);
@@ -119,7 +117,8 @@ export class RegisterService {
 
 	/**
 	 * Start listening. A busy port does not throw: the service marks itself unavailable and the
-	 * install-command tool reports why, so a second pi instance never crashes on startup.
+	 * mint caller (create_machine type "physical") reports why, so a second pi instance never
+	 * crashes on startup.
 	 */
 	static async create(multienvs: MultiEnvs, options: RegisterServiceOptions = {}): Promise<RegisterService> {
 		const resolved: ResolvedOptions = {
@@ -447,47 +446,4 @@ $Response = Invoke-RestMethod -Method Post -Uri $Callback -ContentType 'applicat
 Write-Host "==> done: $($Response | ConvertTo-Json -Compress)"
 `
 	);
-}
-
-/** The registration extension: one tool that mints install commands for new machines. */
-export function createRegistrar(registrar: RegisterService) {
-	return defineExtension({
-		name: "machine-registration",
-		tools: [
-			defineTool({
-				name: "create_install_command",
-				description:
-					"Generate the one-line install command for adding a NEW machine to the cluster. " +
-					"The command embeds this machine's SSH public key, a single-use token and the callback URL; " +
-					"the user runs it once on the target (sudo bash / elevated PowerShell). It installs and starts " +
-					"sshd, authorizes the key, and calls back here — the machine is registered immediately and " +
-					"use_machine can switch to it. Give the user the command verbatim; do not run it yourself.",
-				parameters: Type.Object({
-					name: Type.String({
-						description: 'Machine name to register, e.g. "gpu-1" (letters, digits, dot, dash, underscore)',
-					}),
-					os: Type.Union([Type.Literal("linux"), Type.Literal("windows")], {
-						description: "Target machine's operating system",
-					}),
-				}),
-				async execute(args) {
-					const install = await registrar.mint(args.name, args.os);
-					const minutes = Math.round((install.expiresAt - Date.now()) / 60_000);
-					return {
-						output: [
-							{
-								type: "text",
-								text:
-									`Install command for "${install.name}" (single-use token, expires in ~${minutes} minutes):\n\n` +
-									`${install.command}\n\n` +
-									`Run it once on the target machine${args.os === "linux" ? " with sudo" : " in an elevated PowerShell"}. ` +
-									`It ensures sshd, authorizes this machine's key, and registers "${install.name}" here. ` +
-									`After it finishes, switch with use_machine("${install.name}").`,
-							},
-						],
-					};
-				},
-			}),
-		],
-	});
 }

@@ -25,7 +25,7 @@ import {
 	findInitialAgentModel,
 } from "./harness-setup.ts";
 import { createMultiEnv, MultiEnvs } from "./multienv.ts";
-import { createRegistrar, RegisterService } from "./register.ts";
+import { RegisterService } from "./register.ts";
 import { selectSession } from "./sessions.ts";
 import { createSubagent } from "./subagent.ts";
 
@@ -145,9 +145,9 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const registry = createCodingRegistry(settingsManager, location.cwd);
 		const multienvs = await MultiEnvs.create(PG_URL, location.cwd);
 		const registrar = await RegisterService.create(multienvs);
-		// Orchestrator-only extensions: the root conversation routes machines and manages the cluster;
-		// subagent conversations are created without them, pinned to their assigned machine.
-		const orchestratorOnly = [createMultiEnv(multienvs), createRegistrar(registrar)];
+		// Orchestrator-only extension: the root conversation routes machines and manages the cluster;
+		// subagent conversations are created without it, pinned to their assigned machine.
+		const orchestratorOnly = [createMultiEnv(multienvs, registrar)];
 		registry.install(createSubagent(multienvs, orchestratorOnly));
 		for (const extension of orchestratorOnly) registry.install(extension);
 

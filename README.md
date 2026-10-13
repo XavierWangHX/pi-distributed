@@ -54,9 +54,8 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 | 执行 | `read` `write` `edit` `bash` | pi 原生四件套，跑在本对话当前机器上 | ✅ |
 | 路由 | `use_machine` | 切换本对话的执行机器，会话级、存 PG、重启不丢 | ✅ |
 | 集群 | `list_machines` | 集群点名：名字、类型、状态 | ✅ |
-| 集群 | `create_machine` | 起 docker 沙箱入集群；`from_snapshot` 参数从快照克隆一台 | ✅ |
+| 集群 | `create_machine` | 往集群加机器：默认起 docker 沙箱，`from_snapshot` 从快照克隆；`type: "physical"` 生成物理机的一次性安装命令（内嵌公钥 + 令牌），目标机跑一次自动入队 | ✅ |
 | 集群 | `destroy_machine` | 销毁沙箱 / 注销远端机器（它的快照保留，仍可克隆） | ✅ |
-| 集群 | `create_install_command` | 生成一次性安装命令（内嵌公钥 + 令牌），物理机一键入队 | ✅ |
 | 时间线 | `snapshot_machine` | 给机器当前状态打快照，快照登记进 PG，所有会话共享 | ✅（docker commit 兜底） |
 | 时间线 | `rollback_machine` | 机器回滚到快照；工具输出会明示时间线已回退 | ✅（docker commit 兜底） |
 | 派发 | `subagent` | 派任务 / 按名字续聊；创建时指定机器，配合克隆做到一条 rollout 一台机 | ✅ |
@@ -70,7 +69,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 | --- | --- | --- | --- |
 | 执行 | `read` `write` `edit` `bash` | 钉在创建时分配的机器上，全程不能换 | ✅ |
 
-就这四个，没有别的：不能切机器、不能增删集群、不能碰快照、不能再派发——创建子对话时把 `subagent`（防递归）、`multi-env`、`machine-registration` 三个扩展全部移除，集群控制在结构上就够不着。换机器或重来一次的权力在主 agent：新开一个子 agent，或者回滚机器再重新派发。
+就这四个，没有别的：不能切机器、不能增删集群、不能碰快照、不能再派发——创建子对话时把 `subagent`（防递归）和 `multi-env` 两个扩展全部移除，集群控制在结构上就够不着。换机器或重来一次的权力在主 agent：新开一个子 agent，或者回滚机器再重新派发。
 
 **系统层（不是工具，任何角色都调不到）**
 
@@ -83,7 +82,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 能跑的：
 
 - 本机 + SSH 远端机器，会话级切换（切一次，之后所有工具调用都在那台机器上）
-- 一键收编新机器：`create_install_command` 生成一条命令（内嵌公钥 + 单次令牌），目标机跑一次——装好 sshd、写好 authorized_keys、自动回调注册进集群（linux / windows 安装器都有）
+- 一键收编新机器：`create_machine(type: "physical")` 生成一条安装命令（内嵌公钥 + 单次令牌），目标机跑一次——装好 sshd、写好 authorized_keys、自动回调注册进集群（linux / windows 安装器都有）
 - docker 沙箱：`create_machine` 起个容器就是新手脚（daemon 自动 `docker cp` 进去，SHA-256 校验后才运行），`destroy_machine` 销毁，`list_machines` 点名；alpine 实测通过
 - 机器时间线（docker commit 兜底版）：`snapshot_machine` 打快照、`rollback_machine` 原地回滚、`create_machine(from_snapshot=...)` 克隆；快照存 PG（`pi_machines.snapshots` 表），比机器活得久；冒烟实测通过（快照 → 弄脏 → 回滚 → 克隆 → 重载）
 - 子 agent：指定机器、并行跑、命名续聊（实测过两台机器同时跑）；子对话只保留原生四件套，集群工具在创建时移除，逃不出分配的机器
@@ -120,7 +119,7 @@ node packages/coding-agent/src/experimental/durable/main.ts
 
 无头一轮（和官方 `-p` 同格式，也吃管道 stdin）：`node packages/coding-agent/src/experimental/durable/main.ts -p "你的问题"`；会话照样落 PG，事后可查。
 
-起来就能用——`local`（本机）开箱即有。加远端机器：对话里让 agent 调 `create_install_command`，把它生成的一条命令拿到目标机上跑（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机会自己装好 sshd、写好公钥并注册回来。加沙箱：让 agent `create_machine` 就行。
+起来就能用——`local`（本机）开箱即有。加远端机器：对话里让 agent 调 `create_machine(type: "physical")`，把它生成的一条命令拿到目标机上跑（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机会自己装好 sshd、写好公钥并注册回来。加沙箱：让 agent `create_machine` 就行（默认 docker）。
 
 ---
 

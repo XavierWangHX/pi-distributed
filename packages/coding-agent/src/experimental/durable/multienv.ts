@@ -26,6 +26,7 @@ import {
 } from "@earendil-works/pi-env";
 import pg from "pg";
 import { Type } from "typebox";
+import type { RegisterService } from "./register.ts";
 
 interface RemoteTarget {
 	name: string;
@@ -447,8 +448,11 @@ export class MultiEnvs {
 	}
 }
 
-/** The multi-env extension: machine switching for conversations, plus docker sandbox lifecycle. */
-export function createMultiEnv(multienvs: MultiEnvs) {
+/**
+ * The multi-env extension: machine switching for conversations, cluster membership (docker sandboxes,
+ * physical-machine install commands), and the machine timeline (snapshot/rollback/clone).
+ */
+export function createMultiEnv(multienvs: MultiEnvs, registrar: RegisterService) {
 	const machineName = (name: string): string => {
 		if (name === "local") throw new Error('"local" is reserved for this machine');
 		if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/.test(name))
@@ -459,7 +463,7 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 		if (!multienvs.names().includes(name)) {
 			throw new Error(
 				`Unknown machine "${name}". Known: ${multienvs.names().join(", ")}. ` +
-					`Add one with create_machine (docker sandbox) or create_install_command (physical/VM machine).`,
+					`Add one with create_machine — a docker sandbox, or type "physical" for an install link.`,
 			);
 		}
 		return name;
@@ -517,25 +521,64 @@ export function createMultiEnv(multienvs: MultiEnvs) {
 			defineTool({
 				name: "create_machine",
 				description:
-					`Create a docker container on THIS machine and add it to the cluster as a sandbox. ` +
-					`Use it to isolate untrusted work, or to run parallel subagents each in its own container. ` +
-					`Pass from_snapshot to clone a machine from a snapshot (e.g. one rollout per clone). ` +
-					`The pi-env daemon is deployed into the container automatically; the container is ready ` +
-					`for use_machine and subagent(machine=...) when this returns.`,
+					`Add a machine to the cluster. type "docker" (default): create a container sandbox on THIS ` +
+					`machine — use it to isolate untrusted work, or to run parallel subagents each in its own ` +
+					`container; pass from_snapshot to clone from a snapshot (e.g. one rollout per clone); the pi-env ` +
+					`daemon is deployed automatically and the container is ready for use_machine and ` +
+					`subagent(machine=...) when this returns. ` +
+					`type "physical": mint the install link for a physical/VM machine — a one-line command embedding ` +
+					`this machine's SSH public key, a single-use token and the callback URL. Give the command to the ` +
+					`user verbatim; do NOT run it yourself. The user runs it once on the target (sudo bash / elevated ` +
+					`PowerShell); it installs sshd, authorizes the key, and the machine registers itself here.`,
 				parameters: Type.Object({
-					name: Type.String({ description: 'Machine name for the sandbox, e.g. "sbx-1"' }),
+					name: Type.String({ description: 'Machine name, e.g. "sbx-1" (docker) or "gpu-1" (physical)' }),
+					type: Type.Optional(
+						Type.Union([Type.Literal("docker"), Type.Literal("physical")], {
+							description:
+								"docker (default): container sandbox on this machine. physical: install link for a physical/VM machine",
+						}),
+					),
 					image: Type.Optional(
-						Type.String({ description: `Container image (default ${DEFAULT_CONTAINER_IMAGE})` }),
+						Type.String({ description: `docker only: container image (default ${DEFAULT_CONTAINER_IMAGE})` }),
 					),
 					from_snapshot: Type.Optional(
 						Type.String({
 							description:
-								"Snapshot id to clone the machine from (the machines section lists them); pass either this or image",
+								"docker only: snapshot id to clone the machine from (the machines section lists them); pass either this or image",
+						}),
+					),
+					os: Type.Optional(
+						Type.Union([Type.Literal("linux"), Type.Literal("windows")], {
+							description: "physical only: the target machine's operating system (default linux)",
 						}),
 					),
 				}),
 				async execute(args) {
 					const name = machineName(args.name);
+					if ((args.type ?? "docker") === "physical") {
+						if (args.image !== undefined || args.from_snapshot !== undefined) {
+							throw new Error("image and from_snapshot are for docker machines only.");
+						}
+						const os = args.os ?? "linux";
+						const install = await registrar.mint(name, os);
+						const minutes = Math.round((install.expiresAt - Date.now()) / 60_000);
+						return {
+							output: [
+								{
+									type: "text",
+									text:
+										`Install command for "${install.name}" (single-use token, expires in ~${minutes} minutes):\n\n` +
+										`${install.command}\n\n` +
+										`Give it to the user to run once on the target machine${
+											os === "windows" ? " in an elevated PowerShell" : " with sudo"
+										}. ` +
+										`It ensures sshd, authorizes this machine's key, and registers "${install.name}" here. ` +
+										`After it finishes, switch with use_machine("${install.name}").`,
+								},
+							],
+						};
+					}
+					if (args.os !== undefined) throw new Error('os is for physical machines only (type: "physical").');
 					knownMachineOrFree(name);
 					let image = args.image ?? DEFAULT_CONTAINER_IMAGE;
 					if (args.from_snapshot !== undefined) {

@@ -41,8 +41,8 @@ const Subagents = defineDoc<{ entries: Record<string, { conversation: number; ma
  * outlives the call, so the user can switch to it and keep talking. A named child can be continued by a later call:
  * it keeps its machine and its whole context. The model-facing channel is `output`.
  *
- * `orchestratorOnly` lists the extensions a child must NOT inherit (machine routing, registration): a subagent is an
- * executor pinned to its assigned machine; only the orchestrating conversation manages the cluster.
+ * `orchestratorOnly` lists the extensions a child must NOT inherit (machine routing and cluster management): a
+ * subagent is an executor pinned to its assigned machine; only the orchestrating conversation manages the cluster.
  */
 export function createSubagent(machines: SubagentMachines, orchestratorOnly: readonly Extension[] = []): Extension {
 	let self: Extension;
@@ -132,7 +132,7 @@ export function createSubagent(machines: SubagentMachines, orchestratorOnly: rea
 										type: "text",
 										text:
 											`Unknown machine "${args.machine}". Known: ${machines.names().join(", ")}. ` +
-											`Add one with create_machine (docker sandbox) or create_install_command (physical/VM machine).`,
+											`Add one with create_machine — a docker sandbox, or type "physical" for an install link.`,
 									},
 								],
 								isError: true,
