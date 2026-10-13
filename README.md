@@ -2,46 +2,58 @@
 
 **一个大脑，多双手。**
 
-pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 agent harness。这个 fork 在它上面只干一件事：把 LLM 大脑、干活的手、聊天记录三样东西拆开，各跑各的。
+pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实验分支，只做一件事：把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。
 
-翻译成人话：模型在你 Mac 上想事情，命令可以甩到任何一台机器上执行，聊天记录存在数据库里。三样东西不在一个地方，但用起来就是个普通 agent——`read` / `write` / `edit` / `bash` 还是原来那四个工具，代码一行没改，只是底下接的线不一样。
+模型在你 Mac 上思考，命令派往任意机器——本机、SSH 远端、随起随销的 docker 沙箱；对话与集群状态落进 PostgreSQL。用起来仍是普通 agent：`read` / `write` / `edit` / `bash` 四件套一行未改，只是底下的接线不同。
 
 *One brain, many hands — a fork of [pi](https://github.com/earendil-works/pi) where the model, the machines it works on, and the session log all live in different places.*
 
-## 长这样
+![upstream](https://img.shields.io/badge/upstream-pi_v1.2.0-6e56cf?style=flat-square)
+![node](https://img.shields.io/badge/Node.js-%E2%89%A5_22.19-3c873a?style=flat-square)
+![postgres](https://img.shields.io/badge/PostgreSQL-required-336791?style=flat-square)
+![license](https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square)
 
+## 架构
+
+三个平面，各管各的：
+
+```mermaid
+flowchart TB
+    PG[("存储平面 · PostgreSQL<br/>会话（一会话一 schema）· 集群清单 · 快照登记")]
+    BRAIN["控制平面 · 大脑（LLM 机器）<br/>agent loop · Harness SDK · 进程无状态，可水平复制<br/>本机 local 也是一只手"]
+
+    subgraph HANDS["执行平面 · 手脚（pi-env daemon）"]
+        direction LR
+        subgraph SSH["物理机 / GPU 机器 · SSH · 一键注册"]
+            direction LR
+            G1["gpu-1"]
+            G2["gpu-2"]
+            G3["…"]
+        end
+        subgraph SBX["docker 沙箱 · 快照 / 克隆 / 回滚"]
+            direction LR
+            S1["sbx-1"]
+            S2["sbx-2"]
+            S3["…"]
+        end
+    end
+
+    PG <-->|"一次提交一个事务 · 崩溃后重放"| BRAIN
+    BRAIN -->|"env 回调 · use_machine 会话级路由"| SSH
+    BRAIN -->|"subagent(machine=…) · 一条 rollout 一台"| SBX
 ```
-            ┌──────────────────────────────┐
-            │           PostgreSQL          │
-            │     会话记录 + 机器集群        │
-            │    (Storage · 事务提交)       │
-            └──────────────┬───────────────┘
-                           │ 一次提交一个事务，崩溃后重放
-            ┌──────────────┴───────────────┐
-            │       大脑（LLM 机器）        │
-            │   agent loop · Harness SDK    │
-            │   状态全在 PG · 可水平复制     │
-            └─┬────────────────────────┬───┘
-              │                        │   env 回调（会话级 machine 路由）
-              │                        │
-   物理机 / GPU 集群 · SSH     容器集群 · docker
-     ┌───┐  ┌───┐  ┌───┐      ┌───┐  ┌───┐  ┌───┐
-     │gpu│  │gpu│  │… │      │sbx│  │sbx│  │… │
-     └───┘  └───┘  └───┘      └───┘  └───┘  └───┘
-    pi-env 手脚 · 一键注册    subagent 沙箱对
-```
 
-> 大脑自己那台机器也算一手（`local`）。切机器就两个口子：对话里喊 `use_machine`，或者开子 agent 时指定 `machine`。机器清单和聊天记录全在 PG 里，不在任何配置文件里。
+手脚是每台机器上的 `pi-env` daemon，大脑通过它派发 read/write/edit/bash。切机器只有两个入口：对话里 `use_machine`，或开子 agent 时指定 `machine`。机器清单、快照、聊天记录只存在于 PG——没有本地配置文件，大脑崩了换台机器接着跑。
 
-## 拆开之后能干嘛
+## 为什么拆开
 
-普通 agent（包括 pi 本体）是三合一的：大脑、文件系统、聊天记录焊死在一台机器上。拆开之后有两个直接的好处：
+普通 agent（包括 pi 本体）是三合一：大脑、文件系统、聊天记录焊死在一台机器上。拆开之后，两件事立刻成立：
 
-**1. 一个 agent 管一堆机器。** 对话里说“去 gpu-box 跑个训练”，bash 就在 gpu-box 上执行；说“切回本地”，下一条命令又回到本地。切换是会话级的——持久化在数据库里，重启进程还停在原来那台机器上。加一台机器 = 往表里插一行，不用碰任何配置文件。
+**一个 agent 管一堆机器。** 对话里说“去 gpu-box 跑个训练”，bash 就在 gpu-box 上执行；说“切回本地”，下一条命令又回到本机。切换是会话级的——持久化在数据库里，重启进程还停在原来那台机器上。加一台机器 = 往表里插一行。
 
-**2. 给 Eval / RL 铺路。** 主 agent 可以开一堆子 agent，每个绑一台机器（或者用 `create_machine` 起一个容器沙箱），并行跑 rollout 或 eval。每个子会话都是完整的 durable 记录：中途挂了能续上，事后能翻出来复盘。
+**给 Eval / RL 铺路。** 主 agent 并行开一批子 agent，每个绑一台机器、或一个从快照克隆的沙箱，跑 rollout / eval。每个子会话都是完整的 durable 记录：中途挂了能续，事后能复盘；配合快照与回滚，环境也能回到任意检查点。
 
-另外，因为状态全在数据库里，大脑进程本身没有状态——想开几个开几个，塞容器、接队列调度都行。这就是“支持大规模分布式”的全部秘密：没什么魔法，就是别把状态焊在进程里。
+状态全在数据库，大脑进程便没有状态——想开几个开几个，塞容器、接队列调度都行。“支持大规模分布式”的全部秘密就这一句：别把状态焊在进程里。
 
 ## 工具设计：主 agent 管集群，子 agent 只管干活
 
@@ -77,7 +89,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 - 快照登记进 PG（`pi_machines.snapshots` 表），随系统提示的 machines 段落透出，不设单独的 list 工具
 - 回合边界自动检查点（快照和对话记录对齐，服务崩溃恢复）🚧
 
-## 现在什么状态
+## 现状
 
 能跑的：
 
@@ -93,22 +105,22 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 
 - Gondolin micro-VM 手脚（跑不可信代码的更强隔离，调研完毕待接入）
 - O(1) 快照 / 含内存态的快照（等 micro-VM 后端；现在的 docker commit 兜底只有文件系统态，快照和克隆都是秒级全量拷贝）
-- 回合边界自动检查点（快照和对话记录对齐，崩溃后"对话回放 + 环境回滚"一起还原）
+- 回合边界自动检查点（快照和对话记录对齐，崩溃后“对话回放 + 环境回滚”一起还原）
 - 远端机器的 daemon 升级（linux / windows 远端还没有 listFiles / PTY；windows 欠 ConPTY）
 - 注册加固（公钥 `from=<IP>` 限定、回调限速）
 
-## 和官方 pi 什么关系
+## 与上游 pi 的关系
 
 这是 pi 的分布式实验分支，不是替代品：
 
-- 官方代码原样带着，定期 merge 上游（现在跟到 v1.2.0，零冲突）。
-- 我们加的东西基本全在新文件里（多机器路由、子 agent、PG 存储后端），上游源码没怎么动。
+- 上游代码原样保留，定期 merge（当前跟到 v1.2.0，零冲突）。
+- 新增的东西基本全在新文件里（多机路由、子 agent、PG 存储、机器时间线），上游源码几乎不动。
 - 官方后来删掉了 durable demo，这个分支把它捡回来养着——所有扩展都长在它上面。
 - pi 本身的问题去 [earendil-works/pi](https://github.com/earendil-works/pi) 提；这里只聊分布式这块。
 
-## 跑起来
+## 快速开始
 
-Node ≥ 22.19，外加一个 PostgreSQL（默认连 `postgres://pi:pi@localhost:5433/durable`，环境变量 `PI_PG_URL` 可以改）：
+Node ≥ 22.19，外加一个 PostgreSQL（默认连 `postgres://pi:pi@localhost:5433/durable`，环境变量 `PI_PG_URL` 可改）：
 
 ```bash
 git clone https://github.com/XavierWangHX/pi-distributed.git
@@ -117,9 +129,13 @@ npm install
 node packages/coding-agent/src/experimental/durable/main.ts
 ```
 
-无头一轮（和官方 `-p` 同格式，也吃管道 stdin）：`node packages/coding-agent/src/experimental/durable/main.ts -p "你的问题"`；会话照样落 PG，事后可查。
+无头一轮（与官方 `-p` 同格式，也吃管道 stdin），会话照样落 PG、事后可查：
 
-起来就能用——`local`（本机）开箱即有。加远端机器：对话里让 agent 调 `create_machine(type: "physical")`，把它生成的一条命令拿到目标机上跑（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机会自己装好 sshd、写好公钥并注册回来。加沙箱：让 agent `create_machine` 就行（默认 docker）。
+```bash
+node packages/coding-agent/src/experimental/durable/main.ts -p "你的问题"
+```
+
+起来就能用——`local`（本机）开箱即有。加沙箱：让 agent `create_machine`（默认 docker）。加物理机：让 agent `create_machine(type: "physical")`，把生成的命令拿到目标机上跑一次（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机自己装好 sshd、写好公钥并注册回来。
 
 ---
 
