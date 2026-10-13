@@ -24,11 +24,11 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
             └─┬────────────────────────┬───┘
               │                        │   env 回调（会话级 machine 路由）
               │                        │
-   物理机 / GPU 集群 · SSH 容器集群 · docker（预留）
+   物理机 / GPU 集群 · SSH     容器集群 · docker
      ┌───┐  ┌───┐  ┌───┐      ┌───┐  ┌───┐  ┌───┐
      │gpu│  │gpu│  │… │      │sbx│  │sbx│  │… │
      └───┘  └───┘  └───┘      └───┘  └───┘  └───┘
-    pi-env 手脚 · 动态注册    subagent 沙箱对（预留）
+    pi-env 手脚 · 一键注册    subagent 沙箱对
 ```
 
 > 大脑自己那台机器也算一手（`local`）。切机器就两个口子：对话里喊 `use_machine`，或者开子 agent 时指定 `machine`。机器清单和聊天记录全在 PG 里，不在任何配置文件里。
@@ -39,7 +39,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 
 **1. 一个 agent 管一堆机器。** 对话里说“去 gpu-box 跑个训练”，bash 就在 gpu-box 上执行；说“切回本地”，下一条命令又回到本地。切换是会话级的——持久化在数据库里，重启进程还停在原来那台机器上。加一台机器 = 往表里插一行，不用碰任何配置文件。
 
-**2. 给 Eval / RL 铺路。** 主 agent 可以开一堆子 agent，每个绑一台机器（或者一个容器沙箱），并行跑 rollout 或 eval。每个子会话都是完整的 durable 记录：中途挂了能续上，事后能翻出来复盘。
+**2. 给 Eval / RL 铺路。** 主 agent 可以开一堆子 agent，每个绑一台机器（或者用 `create_machine` 起一个容器沙箱），并行跑 rollout 或 eval。每个子会话都是完整的 durable 记录：中途挂了能续上，事后能翻出来复盘。
 
 另外，因为状态全在数据库里，大脑进程本身没有状态——想开几个开几个，塞容器、接队列调度都行。这就是“支持大规模分布式”的全部秘密：没什么魔法，就是别把状态焊在进程里。
 
@@ -48,14 +48,17 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）是个开源 ag
 能跑的：
 
 - 本机 + SSH 远端机器，会话级切换（切一次，之后所有工具调用都在那台机器上）
+- 一键收编新机器：`create_install_command` 生成一条命令（内嵌公钥 + 单次令牌），目标机跑一次——装好 sshd、写好 authorized_keys、自动回调注册进舰队（linux / windows 安装器都有）
+- docker 沙箱：`create_machine` 起个容器就是新手脚（daemon 自动 `docker cp` 进去，SHA-256 校验后才运行），`destroy_machine` 销毁，`list_machines` 点名；alpine 实测通过
 - 子 agent：指定机器、并行跑、命名续聊（实测过两台机器同时跑）
 - PostgreSQL 会话存储：一个会话一个 schema，进程崩了重启能续
 - 机器清单存 PG（`pi_machines.targets` 表），动态增删；写了个不存在的机器名也不炸，自动回落到本地
 
-还没做的（坑都占好了）：
+还没做的：
 
-- docker 容器当手脚（表里 `kind: "docker"` 字段已预留）
-- 新机器自动注册（现在得手动 INSERT 一行）
+- Gondolin micro-VM 手脚（跑不可信代码的更强隔离，调研完毕待接入）
+- 远端机器的 daemon 升级（linux / windows 远端还没有 listFiles / PTY；windows 欠 ConPTY）
+- 注册加固（公钥 `from=<IP>` 限定、回调限速）
 
 ## 和官方 pi 什么关系
 
@@ -77,7 +80,7 @@ npm install
 node packages/coding-agent/src/experimental/durable/main.ts
 ```
 
-起来就能用——`local`（本机）开箱即有。想加远端机器：那台机器上放好 `pi-env` daemon，往 `pi_machines.targets` 表插一行（名字、host、user）就行。
+起来就能用——`local`（本机）开箱即有。加远端机器：对话里让 agent 调 `create_install_command`，把它生成的一条命令拿到目标机上跑（linux 是 `curl … | sudo bash`，windows 是管理员 PowerShell 里 `irm … | iex`），目标机会自己装好 sshd、写好公钥并注册回来。加沙箱：让 agent `create_machine` 就行。
 
 ---
 
