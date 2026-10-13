@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-12
+
 ### Breaking Changes
 
 - Changed `CallToolResult.structuredContent` from `Record<string, unknown>` to `unknown`: `callTool()` now accepts any JSON value as structured content, including arrays and `null`, as MCP 2026-07-28 allows, instead of failing with "Invalid MCP tools/call structured content" ([#10416](https://github.com/earendil-works/pi/issues/10416))

@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-12
+
 ### Breaking Changes
 
 - Removed `MCP_TYPESCRIPT_PREAMBLE` and `mcpStructuredContentSchema()`. `renderToolOutputType()` and the declarations built on it render every output schema as its own type and no longer turn MCP `CallToolResult` schemas into `CallToolResult<T>`; describe MCP results in the output schema instead
