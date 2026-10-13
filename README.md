@@ -1,3 +1,30 @@
+# pi-distributed
+
+**一个大脑，多双手 —— earendil-works/pi 的分布式扩展分支。**
+*One brain, many hands: a fork of [earendil-works/pi](https://github.com/earendil-works/pi) that keeps and extends the durable-agent demo upstream deleted — multi-machine execution environments, PostgreSQL-backed sessions and fleet registry, machine-pinned subagents.*
+
+## 与官方 pi 的关系
+
+- **这是pi的分布式实验分支，不是替代**。本仓库唯一目的是承载官方仓库里不存在的分布式实验；CLI 能力、包结构、API 与上游保持一致，`main` 分支定期 `git merge` 上游 `main` 跟进。
+- 官方仓库的问题/PR 请去 [earendil-works/pi](https://github.com/earendil-works/pi)；本仓库只讨论分布式扩展。
+
+## 快速开始
+
+要求：Node ≥ 22.19；PostgreSQL（默认 `postgres://pi:pi@localhost:5433/durable`，可用环境变量 `PI_PG_URL` 覆盖）。
+
+```bash
+git clone https://github.com/XavierWangHX/pi-distributed.git
+cd pi-distributed
+npm install
+node packages/coding-agent/src/experimental/durable/main.ts
+```
+
+开箱即用 `local` 目标（本机执行）。加入远端"双手"：在 `pi_machines.targets` 插一行（name/host/user 等 SSH 信息），远端机器放好 `pi-env` daemon 即可；未注册的 target 自动回落 `local`。
+
+---
+
+*以下为官方 pi 的 README，原样保留供参考（描述上游 monorepo 本身）。*
+
 <p align="center">
   <a href="https://pi.dev">
     <img alt="pi logo" src="https://pi.dev/logo-auto.svg" width="128">
