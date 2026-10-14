@@ -462,7 +462,10 @@ class DurableTui {
 			this.#chat.addChild(new Spacer(1));
 			this.#chat.addChild(summary);
 		} else if (entry.kind === "pi.reset") this.#addText("[new context]");
-		else if (!entry.kind.startsWith("pi.") && message?.role === "user" && entry.model?.length === 1) {
+		else if (entry.kind === "app.subagent-report" && message?.role === "user") {
+			// A background subagent's completion report, queued by the host watcher.
+			this.#addText(`⚙ ${userText(message.content)}`);
+		} else if (!entry.kind.startsWith("pi.") && message?.role === "user" && entry.model?.length === 1) {
 			// An input placed as an application entry.
 			this.#chat.addChild(new Spacer(1));
 			this.#chat.addChild(new UserMessageComponent(userText(message.content)));

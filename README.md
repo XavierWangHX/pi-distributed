@@ -70,7 +70,7 @@ flowchart TB
 | 集群 | `destroy_machine` | 销毁沙箱 / 注销远端机器（它的快照保留，仍可克隆） | ✅ |
 | 时间线 | `snapshot_machine` | 给机器当前状态打快照，快照登记进 PG，所有会话共享 | ✅（docker commit 兜底） |
 | 时间线 | `rollback_machine` | 机器回滚到快照；工具输出会明示时间线已回退 | ✅（docker commit 兜底） |
-| 派发 | `subagent` | 派任务 / 按名字续聊；创建时指定机器，配合克隆做到一条 rollout 一台机 | ✅ |
+| 派发 | `subagent` | 派任务（前台阻塞，返回孩子最终答案）或后台跑（`background` + `name`：立即返回，`wait` 收割、`stop` 停止、完成自动报告，跨 abort 与重启存活，每会话预算 64）；按名字续聊；创建时指定机器，配合克隆做到一条 rollout 一台机 | ✅ |
 | 派发 | `list_subagents` | 列出本会话的命名子 agent | ✅ |
 
 时间线工具吃后端能力：docker 类型先用 `commit` 慢快照兜底（只有文件系统态，进程和内存不保存，恢复后要重新拉起服务），micro-VM 后端（Gondolin / CubeSandbox 类）才有 O(1) 克隆和含内存态的快照；ssh 物理机没有虚拟化层，不支持快照，工具会明说。
@@ -87,6 +87,7 @@ flowchart TB
 
 - env 回调按对话的 Machine 文档解析 ExecutionEnv——机器路由的底层接线
 - 快照登记进 PG（`pi_machines.snapshots` 表），随系统提示的 machines 段落透出，不设单独的 list 工具
+- 后台子代理的完成看守：宿主盯住它的 submission，答案写回 Subagents 文档并向父对话报告（父忙则排队、父闲则唤醒）；重启后从文档自动重挂，通知不丢
 - 回合边界自动检查点（快照和对话记录对齐，服务崩溃恢复）🚧
 
 ## 现状
@@ -98,11 +99,13 @@ flowchart TB
 - docker 沙箱：`create_machine` 起个容器就是新手脚（daemon 自动 `docker cp` 进去，SHA-256 校验后才运行），`destroy_machine` 销毁，`list_machines` 点名；alpine 实测通过
 - 机器时间线（docker commit 兜底版）：`snapshot_machine` 打快照、`rollback_machine` 原地回滚、`create_machine(from_snapshot=...)` 克隆；快照存 PG（`pi_machines.snapshots` 表），比机器活得久；冒烟实测通过（快照 → 弄脏 → 回滚 → 克隆 → 重载）
 - 子 agent：指定机器、并行跑、命名续聊（实测过两台机器同时跑）；子对话只保留原生四件套，集群工具在创建时移除，逃不出分配的机器
+- 后台子 agent：`subagent(background: true, name: …)` 启动即返回；子对话 ownerless——父对话 abort、进程重启都不影响它继续跑；`wait` 收割答案、`stop` 显式停止、完成自动向父对话报告；faux 模型全链路实测（启动 → 收割 → 报告 → 挂起 → 停止）
 - PostgreSQL 会话存储：一个会话一个 schema，进程崩了重启能续
 - 机器清单存 PG（`pi_machines.targets` 表），动态增删；写了个不存在的机器名也不炸，自动回落到本地
 
 还没做的：
 
+- 大脑 daemon 化（TUI 与调度器分进程，后台工作跨进程存活）：等上游的 unix-socket client-server 实验成熟后跟进对齐，不自造协议
 - Gondolin micro-VM 手脚（跑不可信代码的更强隔离，调研完毕待接入）
 - O(1) 快照 / 含内存态的快照（等 micro-VM 后端；现在的 docker commit 兜底只有文件系统态，快照和克隆都是秒级全量拷贝）
 - 回合边界自动检查点（快照和对话记录对齐，崩溃后“对话回放 + 环境回滚”一起还原）

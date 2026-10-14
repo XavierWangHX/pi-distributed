@@ -1,6 +1,11 @@
 import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { clampThinkingLevel, getSupportedThinkingLevels, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	clampThinkingLevel,
+	getSupportedThinkingLevels,
+	type ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 import {
 	type AgentState,
 	AssistantEntry,
@@ -8,11 +13,13 @@ import {
 	type ConversationId,
 	type ConversationView,
 	type Cursor,
+	type EntryId,
 	type EntryRecord,
 	Harness,
 	type ModelRef,
 	ROOT_CONVERSATION_ID,
 	type Submission,
+	type SubmissionId,
 	type TaskGraph,
 } from "@earendil-works/pi-durable";
 import { openPgStorage } from "@earendil-works/pi-durable/storage/pg";
@@ -27,7 +34,7 @@ import {
 import { createMultiEnv, MultiEnvs } from "./multienv.ts";
 import { RegisterService } from "./register.ts";
 import { selectSession } from "./sessions.ts";
-import { createSubagent } from "./subagent.ts";
+import { createSubagent, Subagents } from "./subagent.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -148,7 +155,19 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		// Orchestrator-only extension: the root conversation routes machines and manages the cluster;
 		// subagent conversations are created without it, pinned to their assigned machine.
 		const orchestratorOnly = [createMultiEnv(multienvs, registrar)];
-		registry.install(createSubagent(multienvs, orchestratorOnly));
+		// Late-bound: the completion watcher below is defined once the Harness exists.
+		let attachBackground:
+			| ((name: string, info: { conversation: number; parent?: number; submission?: number }) => void)
+			| undefined;
+		registry.install(
+			createSubagent(multienvs, orchestratorOnly, (start) =>
+				attachBackground?.(start.name, {
+					conversation: start.child,
+					parent: start.parent,
+					submission: start.submission,
+				}),
+			),
+		);
 		for (const extension of orchestratorOnly) registry.install(extension);
 
 		const pendingReports: unknown[] = [];
@@ -174,6 +193,97 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		});
 		const label = (id: ConversationId): string => (id === root.id ? "main" : `subagent ${id}`);
 		const opened = harness;
+
+		// Background subagent completion: watch each run's submission, record the answer in the session doc
+		// (durable, so `wait` can collect it across restarts), and report into the parent conversation as a
+		// queued input. The startup scan below re-attaches from the doc, so a restart misses no report.
+		const watching = new Set<string>();
+		const textOfAnswer = async (answer: EntryId): Promise<string> => {
+			const entry = await opened.commit((tx) => tx.entry(AssistantEntry, answer), context);
+			const message = entry?.model?.[0] as AssistantMessage | undefined;
+			return message?.content.flatMap((block) => (block.type === "text" ? block.text : "")).join("") ?? "";
+		};
+		const lastAnswer = async (id: ConversationId): Promise<string | undefined> => {
+			const conversation = await opened.conversation(id, context);
+			if (conversation === undefined) return undefined;
+			let text: string | undefined;
+			let cursor: Cursor | undefined;
+			do {
+				const page = await conversation.entries({}, 256, cursor, context);
+				for (const entry of page.items) {
+					if (entry.kind !== "pi.assistant") continue;
+					const message = entry.model?.[0] as AssistantMessage | undefined;
+					const candidate = message?.content
+						.flatMap((block) => (block.type === "text" ? block.text : ""))
+						.join("");
+					if (candidate !== undefined && candidate !== "") text = candidate;
+				}
+				cursor = page.next;
+			} while (cursor !== undefined);
+			return text;
+		};
+		const watchBackground = (
+			name: string,
+			info: { conversation: number; parent?: number; submission?: number },
+		): void => {
+			if (watching.has(name)) return;
+			watching.add(name);
+			void (async () => {
+				try {
+					let text: string;
+					const submission =
+						info.submission !== undefined
+							? await opened.submission(info.submission as SubmissionId, context)
+							: undefined;
+					if (submission !== undefined) {
+						const settled = await submission.wait(context);
+						text =
+							settled.status === "done" && settled.type === "input"
+								? await textOfAnswer(settled.answer)
+								: `(no answer: ${settled.status === "unanswered" ? settled.reason : settled.status})`;
+					} else {
+						// A crash before the submission was recorded: wait out the child, then take its last answer.
+						const child = await opened.conversation(info.conversation as ConversationId, context);
+						if (child === undefined) text = "(child conversation is gone)";
+						else {
+							await child.waitForIdle(context);
+							text = (await lastAnswer(info.conversation as ConversationId)) ?? "(no answer produced)";
+						}
+					}
+					await opened.commit(async (tx) => {
+						const entry = (await tx.doc(Subagents)).entries[name];
+						if (entry !== undefined && entry.result === undefined) {
+							entry.result = text;
+							entry.settledAt = Date.now();
+						}
+					}, context);
+					if (info.parent !== undefined) {
+						const parent = await opened.conversation(info.parent as ConversationId, context);
+						const summary =
+							text.length > 1200 ? `${text.slice(0, 1200)}\n…（全文用 subagent wait: "${name}" 取）` : text;
+						await parent?.submit(
+							{
+								type: "input",
+								content: `后台子代理 "${name}" 已完成。它的答案：\n${summary}`,
+								whenBusy: "followUp",
+								entry: { kind: "app.subagent-report" },
+							},
+							context,
+						);
+					}
+				} catch {
+					// The session is closing or the run is gone; a restart re-attaches from the doc.
+				} finally {
+					watching.delete(name);
+				}
+			})();
+		};
+		attachBackground = watchBackground;
+		const subagentsDoc = await opened.snapshot(Subagents, context).catch(() => undefined);
+		for (const [name, entry] of Object.entries(subagentsDoc?.entries ?? {})) {
+			if (entry.background === true && entry.result === undefined) watchBackground(name, entry);
+		}
+
 		const summaries: ConversationSummary[] = [];
 		let cursor: Cursor | undefined;
 		do {
