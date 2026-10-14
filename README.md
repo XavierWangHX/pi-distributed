@@ -4,7 +4,7 @@
 
 pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实验分支，只做一件事：把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。
 
-模型在你 Mac 上思考，命令派往任意机器——本机、SSH 远端、随起随销的 docker 沙箱；对话与集群状态落进 PostgreSQL。用起来仍是普通 agent：`read` / `write` / `edit` / `bash` 四件套一行未改，只是底下的接线不同。
+模型在云端思考，命令派往任意机器——物理机（Mac/Linux/Windows）、随起随销的 docker 沙箱；对话与集群状态落进云端 PostgreSQL。用起来仍是普通 agent：`read` / `write` / `edit` / `bash` 四件套一行未改，只是执行端不同。
 
 *One brain, many hands — a fork of [pi](https://github.com/earendil-works/pi) where the model, the machines it works on, and the session log all live in different places.*
 
@@ -45,11 +45,17 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实
 
 ## 为什么拆开
 
-普通 agent（包括 pi 本体）是三合一：大脑、文件系统、聊天记录焊死在一台机器上。拆开之后，两件事立刻成立：
+你是否厌烦在自己的多台电脑上反复配置同样的 agent？
 
-**一个 agent 管一堆机器。** 对话里说“去 gpu-box 跑个训练”，bash 就在 gpu-box 上执行；说“切回本地”，下一条命令又回到本机。切换是会话级的——持久化在数据库里，重启进程还停在原来那台机器上。加一台机器 = 往表里插一行。
+现有的 Harness（Claude Code、DeepSeek Harness、pi）都把 LLM（大脑）、文件系统与 Tool 执行环境（手脚）、Session 会话数据（上下文）绑死在同一台本地电脑上。我们从产品角度重新拆解 Harness——拆开之后，四件事立刻成立：
 
-**给 Eval / RL 铺路。** 主 agent 并行开一批子 agent，每个绑一台机器、或一个从快照克隆的沙箱，跑 rollout / eval。每个子会话都是完整的 durable 记录：中途挂了能续，事后能复盘；配合快照与回滚，环境也能回到任意检查点。
+**1. 一个入口，管自己所有的设备。** 大脑跑在常用笔记本上，其他机器只装一个轻量执行环境（单文件 1MB 出头），一个 Agent 在任一 Mac / Linux / Windows 机器上执行 `read` / `write` / `edit` / `bash` 都像在本地原生运行。对话里说“去 gpu-box 跑个训练”，bash 就在 gpu-box 上执行；说“切回本地”，下一条命令又回到本机——切换是会话级的，持久化在数据库里，重启进程还停在原来那台机器上；加一台机器 = 往表里插一行。Session 上下文存云端 PostgreSQL，随时可从任一设备接着对话。
+
+**2. Eval Harness 评测。** 物理机扩展成沙箱集群（批量创建 / 快照 / 回滚 / 克隆）之后，主 Agent 指定镜像批量创建沙箱，派发时指定子 Agent 跑在哪一个沙箱里。评测跑完，从云端数据库取出子 Agent 的会话记录、取出带文件系统状态变化的沙箱快照，打分、总结失败原因、更新有缺陷的 Skill 和文档——形成 RSI 自改进循环。
+
+**3. 大规模 RL 训练。** 主 Agent 批量创建沙箱和 Subagent 跑批量 rollout，一条 rollout 一台机。每个子会话都是完整的 durable 记录：中途挂了能续，事后能复盘；配合快照与回滚，环境也能回到任意检查点。
+
+**4. 算法策略探索。** 力大砖飞：批量创建 Agent 和沙箱、挂载不同的 GPU 集群，同时实验不同的算法策略，跑完比较哪个结果更好，形成算法的 RSI 自进化。
 
 状态全在数据库，大脑进程便没有状态——想开几个开几个，塞容器、接队列调度都行。“支持大规模分布式”的全部秘密就这一句：别把状态焊在进程里。
 
