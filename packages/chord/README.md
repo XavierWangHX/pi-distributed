@@ -23,12 +23,13 @@ Contracts are runtime values described with [TypeBox](https://github.com/sinclai
 
 ```ts
 import { Type } from "typebox";
-import { createHost, method, remote } from "@earendil-works/chord";
+import { createHost, hostNamed, method, remote } from "@earendil-works/chord";
 
 // contract.ts: shared by provider and consumers
 export const Counter = remote("demo.counter", {
 	version: 1,
 	input: Type.Object({ name: Type.String() }),
+	host: hostNamed("server"), // where its objects live; callers never name a host
 	variants: {
 		default: {
 			state: { count: Type.Number() },
@@ -37,7 +38,7 @@ export const Counter = remote("demo.counter", {
 	},
 });
 
-const host = createHost({ name: "server", principalKey: (p) => p.kind });
+const host = createHost({ name: "server", self: { kind: "server" } });
 
 host.serve(Counter, ({ name }, _principal, self) => {
 	const count = self.state("count", Type.Number(), 0);
@@ -51,7 +52,7 @@ host.serve(Counter, ({ name }, _principal, self) => {
 });
 
 await host.root(async (ctx) => {
-	const clicks = ctx.get(Counter, { name: "clicks" }); // a reference; released when this root ends
+	const clicks = await ctx.get(Counter, { name: "clicks" }); // ready, with its state; released when this root ends
 	clicks.count.subscribe((n) => console.log("count", n));
 	await clicks.increment({ by: 2 }, ctx); // logs 0, then 2
 });

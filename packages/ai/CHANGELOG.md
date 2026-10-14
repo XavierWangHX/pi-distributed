@@ -2,10 +2,25 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Removed `AssistantMessageFrame`, `AssistantMessageFrameEncoder`, and `reduceAssistantMessageFrames()`. They were only used by the removed experimental agent harness.
+
+### Added
+
+- Added cache-preserving thinking level changes for GPT-6 models on the openai provider: with an API key, the level is sent as configuration_update input items instead of changing reasoning.effort, controlled by compat.supportsMidConvoEffort ([#10853](https://github.com/earendil-works/pi/issues/10853))
+
 ### Fixed
 
 - Fixed tool-call argument parsing dropping fields when a string contains an invalid `\u` escape such as `\usepackage` ([#10868](https://github.com/earendil-works/pi/issues/10868))
 - Fixed Anthropic requests failing with a 400 when an error tool result contains images; the images are now replaced with a text note ([#10794](https://github.com/earendil-works/pi/issues/10794))
+- Fixed OpenCode Go Gemini models failing with a 404 by moving OpenCode Zen and OpenCode Go to the `opencode.ai/inference` endpoints, and added Google Generative AI support to the OpenCode Go provider
+- Fixed OpenCode Go MiniMax M2.7 failing with "Model does not support this protocol" by using the Anthropic Messages API
+- Fixed automatic retry not triggering for gateway `Unable to forward upstream stream` errors ([#10920](https://github.com/earendil-works/pi/issues/10920))
+- Fixed OpenAI-compatible responses showing thinking after the answer when a proxy such as LiteLLM sends reasoning and content in the same stream chunk ([#10926](https://github.com/earendil-works/pi/issues/10926))
+- Fixed Gemini 4 Argon requests on Google Vertex failing with "Thinking budget is not supported", and its thinking level being ignored on the Gemini API, by sending `thinkingLevel` for Gemini 4 and later models ([#10890](https://github.com/earendil-works/pi/issues/10890))
+- Fixed Xiaomi MiMo models failing with a 400 at the `minimal` thinking level by sending only the documented thinking on/off toggle and exposing only the `off` and `high` levels ([#10818](https://github.com/earendil-works/pi/issues/10818))
+- Fixed `openai-codex/gpt-6.1-sol` using a 272K context window instead of the 500K window Codex now provides ([#10840](https://github.com/earendil-works/pi/issues/10840))
 
 ## [1.2.0] - 2026-10-12
 

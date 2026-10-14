@@ -2,12 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+
+- Changing the thinking level mid-session on OpenAI GPT-6 models (API key) now keeps the prompt cache ([#10853](https://github.com/earendil-works/pi/issues/10853))
+
 ### Fixed
 
 - Pinned internal Pi dependencies to exact release versions to prevent fresh installs from mixing incompatible packages ([#10865](https://github.com/earendil-works/pi/issues/10865))
 - Fixed resumed sessions dropping tools activated during the session. Resume now restores the session's active tools, with `--tools +name`/`-name` entries applied to them, unless `--tools` with tool names, `--no-tools`, or `--no-builtin-tools` selects tools explicitly ([#10785](https://github.com/earendil-works/pi/issues/10785))
 - Fixed stopping a codemode script or reaching its deadline waiting for a non-interruptible built-in to return on Bun ([#10748](https://github.com/earendil-works/pi/issues/10748))
 - Fixed repeated codemode timeouts or aborts accumulating surviving workers; admission now limits live workers to two across sessions, counting cancelled workers until actual exit ([#10748](https://github.com/earendil-works/pi/issues/10748))
+- Fixed `--model` choosing a provider by catalog order when several providers offer the match; Pi now prefers the provider with credentials and otherwise reports the ambiguity. `--models` and `enabledModels` add a model for each provider that offers it and warn about the ambiguity ([#10160](https://github.com/earendil-works/pi/issues/10160))
+- Fixed `read` line-range labels for numeric-string or null arguments in the TUI, session tree, HTML exports, and examples ([#9887](https://github.com/earendil-works/pi/issues/9887))
+- Fixed prompt templates dropping empty quoted arguments (`""` or `''`), which shifted later positional arguments and prevented positional defaults from applying ([#10867](https://github.com/earendil-works/pi/issues/10867))
 
 ## [1.2.0] - 2026-10-12
 
