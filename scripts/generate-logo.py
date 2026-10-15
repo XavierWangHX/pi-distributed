@@ -23,6 +23,7 @@ SAMPLES = 24  # polyline segments per curve
 
 INK_LIGHT, INK_DARK = "#101014", "#f5f5f7"
 ACC_LIGHT, ACC_DARK = "#9c27b0", "#c084fc"
+MONO = True  # single-color wordmark; set False for purple stroke accents
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "assets", "logo.svg")
@@ -232,16 +233,17 @@ def main():
     ]
     out += [f'<path d="{d}"/>' for i, d in paths]
     out.append("</g>")
-    for n, (i, x0, y0, x1, y1) in enumerate(bands):
-        pen = laid[i][1]
-        rx, ry = tx(x0, pen), ty(y1)
-        rw, rh = round((x1 - x0) / upm * EM, 2), round((y1 - y0) / upm * EM, 2)
-        out.append(f'<clipPath id="a{n}"><rect x="{rx}" y="{ry}" width="{rw}" height="{rh}"/></clipPath>')
-    for n, (i, x0, y0, x1, y1) in enumerate(bands):
-        d = [d for j, d in paths if j == i][0]
-        out.append(f'<g class="acc" clip-path="url(#a{n})"><path d="{d}"/></g>')
+    if not MONO:
+        for n, (i, x0, y0, x1, y1) in enumerate(bands):
+            pen = laid[i][1]
+            rx, ry = tx(x0, pen), ty(y1)
+            rw, rh = round((x1 - x0) / upm * EM, 2), round((y1 - y0) / upm * EM, 2)
+            out.append(f'<clipPath id="a{n}"><rect x="{rx}" y="{ry}" width="{rw}" height="{rh}"/></clipPath>')
+        for n, (i, x0, y0, x1, y1) in enumerate(bands):
+            d = [d for j, d in paths if j == i][0]
+            out.append(f'<g class="acc" clip-path="url(#a{n})"><path d="{d}"/></g>')
     out.append(
-        '<path class="acc" d="M'
+        f'<path class="{"ink" if MONO else "acc"}" d="M'
         + " L".join(f"{tx(x, laid[hi][1])} {ty(y)}" for x, y in hyphen_pts)
         + ' Z"/>'
     )
