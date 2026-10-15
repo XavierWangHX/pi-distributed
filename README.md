@@ -84,7 +84,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实
 | 派发 | `subagent` | 派任务（前台阻塞，返回孩子最终答案）或后台跑（`background` + `name`：立即返回，`wait` 收割、`stop` 停止、完成自动报告，跨 abort 与重启存活，每会话预算 64）；按名字续聊；创建时指定机器，配合克隆做到一条 rollout 一台机 | ✅ |
 | 派发 | `list_subagents` | 列出本会话的命名子 agent | ✅ |
 
-时间线工具吃后端能力：docker 类型先用 `commit` 慢快照兜底（只有文件系统态，进程和内存不保存，恢复后要重新拉起服务），micro-VM 后端（Gondolin / CubeSandbox 类）才有 O(1) 克隆和含内存态的快照；ssh 物理机没有虚拟化层，不支持快照，工具会明说。
+时间线工具吃后端能力：docker 类型先用 `commit` 慢快照兜底（只有文件系统态，进程和内存不保存，恢复后要重新拉起服务），micro-VM 后端（AgentENV，已选型）才有 O(1) 克隆和含内存态的快照；ssh 物理机没有虚拟化层，不支持快照，工具会明说。
 
 **子 agent（子对话）**
 
@@ -117,8 +117,8 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实
 还没做的：
 
 - 大脑 daemon 化（TUI 与调度器分进程，后台工作跨进程存活）：等上游的 unix-socket client-server 实验成熟后跟进对齐，不自造协议
-- Gondolin micro-VM 手脚（跑不可信代码的更强隔离，调研完毕待接入）
-- O(1) 快照 / 含内存态的快照（等 micro-VM 后端；现在的 docker commit 兜底只有文件系统态，快照和克隆都是秒级全量拷贝）
+- AgentENV micro-VM 后端接入（替代原 Gondolin 方案，已选型）：Firecracker + E2B 兼容 API，Kimi K3 RL 训练的生产底座（MIT）。AENV 单独安装在 Linux/KVM 主机（kernel 6.8+），我们只写调用接口适配层——multienv 新增 aenv target，生命周期走 E2B 契约，执行通道复用烘进模板的 pi-env
+- O(1) 快照 / 含内存态的快照（等 AgentENV 后端：内存态快照、秒级 fork、pause/resume、镜像按需加载；现在的 docker commit 兜底只有文件系统态，快照和克隆都是秒级全量拷贝）
 - 回合边界自动检查点（快照和对话记录对齐，崩溃后“对话回放 + 环境回滚”一起还原）
 - 远端机器的 daemon 升级（linux / windows 远端还没有 listFiles / PTY；windows 欠 ConPTY）
 - 注册加固（公钥 `from=<IP>` 限定、回调限速）
@@ -129,7 +129,6 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实
 
 - 上游代码原样保留，定期 merge（当前跟到 v1.2.0，零冲突）。
 - 新增的东西基本全在新文件里（多机路由、子 agent、PG 存储、机器时间线），上游源码几乎不动。
-- 官方后来删掉了 durable demo，这个分支把它捡回来养着——所有扩展都长在它上面。
 - pi 本身的问题去 [earendil-works/pi](https://github.com/earendil-works/pi) 提；这里只聊分布式这块。
 
 ## 快速开始
