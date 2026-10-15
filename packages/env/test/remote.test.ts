@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT, withAbortSignal } from "@earendil-works/chord/context";
@@ -173,4 +173,37 @@ describe("RemoteExecutionEnv", () => {
 		await reader.close(context);
 		expect(Buffer.compare(Buffer.from(range), Buffer.from(read.subarray(1_000_003, 3_000_003)))).toBe(0);
 	}, 60_000);
+
+	it("resolves a relative environment cwd against the remote's own working directory, not the client's", async () => {
+		const remoteCwd = mkdtempSync(join(tmpdir(), "pi-env-remote-cwd-"));
+		dirs.push(remoteCwd);
+		mkdirSync(join(remoteCwd, "sub"));
+		// Start the daemon in remoteCwd so its working directory differs from this process's.
+		const wrapper = join(remoteCwd, "cd-exec.sh");
+		writeFileSync(wrapper, '#!/bin/sh\ncd "$1" || exit 1\nshift\nexec "$@"\n');
+		chmodSync(wrapper, 0o755);
+		const connection = new Connection({ command: [wrapper, remoteCwd, daemon] });
+		connections.push(connection);
+		const env = new RemoteExecutionEnv({ connection, id: "pi-env:test", cwd: "." });
+		const home = realpathSync(remoteCwd);
+		for (const [cwd, expected] of [
+			[".", home],
+			["sub", join(home, "sub")],
+		] as const) {
+			let out = "";
+			const result = await env.exec(
+				["sh", "-c", "pwd -P"],
+				{
+					cwd,
+					onOutput: (text: string) => {
+						out += text;
+					},
+				},
+				context,
+			);
+			expect(getOrThrow(result).exitCode).toBe(0);
+			expect(out.trim()).toBe(expected);
+			expect(out.trim()).not.toBe(realpathSync(process.cwd()));
+		}
+	}, 30_000);
 });

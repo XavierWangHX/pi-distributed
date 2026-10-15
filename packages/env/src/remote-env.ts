@@ -398,7 +398,10 @@ export class RemoteExecutionEnv implements ExecutionEnv {
 				return win32.resolve(base, normalized);
 			}
 		}
-		return paths.resolve(this.cwd, normalized);
+		// A relative environment cwd (the ssh default ".") must anchor on the remote's own working
+		// directory: resolving against this process's cwd would leak the client's directory to the peer.
+		const base = paths.isAbsolute(this.cwd) ? this.cwd : info.cwd;
+		return paths.resolve(base, normalized);
 	}
 
 	async #fileOp<T>(
