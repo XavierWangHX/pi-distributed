@@ -1,17 +1,24 @@
-# pi-distributed
+<p align="center">
+  <img src="assets/logo.svg" alt="Pi-Distributed" width="680">
+</p>
 
-**一个大脑，多双手。**
+<p align="center">
+  <strong>一个大脑，多双手。</strong><br>
+  <sub>把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。</sub>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/upstream-pi_v1.2.0-9c27b0?style=flat-square" alt="upstream">
+  <img src="https://img.shields.io/badge/Node.js-%E2%89%A5_22.19-3c873a?style=flat-square" alt="node">
+  <img src="https://img.shields.io/badge/PostgreSQL-required-336791?style=flat-square" alt="postgres">
+  <img src="https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square" alt="license">
+</p>
 
 pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实验分支，只做一件事：把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。
 
 模型在云端思考，命令派往任意机器——物理机（Mac/Linux/Windows）、随起随销的 docker 沙箱；对话与集群状态落进云端 PostgreSQL。用起来仍是普通 agent：`read` / `write` / `edit` / `bash` 四件套一行未改，只是执行端不同。
 
 *One brain, many hands — a fork of [pi](https://github.com/earendil-works/pi) where the model, the machines it works on, and the session log all live in different places.*
-
-![upstream](https://img.shields.io/badge/upstream-pi_v1.2.0-6e56cf?style=flat-square)
-![node](https://img.shields.io/badge/Node.js-%E2%89%A5_22.19-3c873a?style=flat-square)
-![postgres](https://img.shields.io/badge/PostgreSQL-required-336791?style=flat-square)
-![license](https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square)
 
 ## 架构
 
