@@ -4,7 +4,7 @@
 
 <p align="center">
   <strong>一个大脑，多双手。</strong><br>
-  <sub>把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。</sub>
+  <sub>把 LLM 大脑、工具执行环境、Session上下文记录三者解耦，支持大规模分布式扩展。</sub>
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square" alt="license">
 </p>
 
-pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实验分支，只做一件事：把 LLM 大脑、干活的机器、会话记录三者解耦，各自独立伸缩。
+pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实验分支，只做一件事：把 LLM 大脑、工具执行环境、Session上下文记录三者解耦，支持大规模分布式扩展。
 
 模型在云端思考，命令派往任意机器——物理机（Mac/Linux/Windows）、随起随销的 docker 沙箱；对话与集群状态落进云端 PostgreSQL。用起来仍是普通 agent：`read` / `write` / `edit` / `bash` 四件套一行未改，只是执行端不同。
 
