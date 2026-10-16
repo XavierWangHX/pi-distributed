@@ -475,9 +475,15 @@ settings: {
 		reserveTokens: 16384, // above contextWindow - reserveTokens, the next request waits for a compaction
 		keepRecentTokens: 20000, // roughly how much recent context stays verbatim
 		backgroundTokens: 32768, // this far below that, a compaction starts in the background; 0 disables it
+		modelOverrides: {
+			// exact "provider/modelId"; each field set here replaces the one above for that model
+			"local/small-32k": { reserveTokens: 4096, keepRecentTokens: 8000, backgroundTokens: 4096 },
+		},
 	},
 }
 ```
+
+The fixed token counts rarely suit a 32k and a 1M context window alike; `modelOverrides` lets one harness serve both. The conversation's current model picks the entry, at the threshold check, after a context overflow, and when a compaction selects what to summarize.
 
 When a provider rejects a request because the context is too long, generation compacts and retries once. A summary that would cut before the start of the current context settles as `stale` when it is placed, so when several are in flight, the furthest cut stays in effect. Summarization spend counts in `pi.usage`. A `beforeCompact` hook on `CompactionTask` can decline or supply its own summary.
 
@@ -662,6 +668,23 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 | JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. Keeps the whole history in memory too, so memory grows with it; use SQLite for long-running agents. |
 | Cloudflare Durable Object | `openDurableObjectSqliteStorage(ctx.storage)` from `@earendil-works/pi-durable/storage/sqlite/cloudflare` | The SQLite storage of one SQLite-backed Durable Object; commits are its storage transactions. |
 
+SQLite storage can namespace its tables and indexes when sharing a database: pass `{ prefix: "pi_" }` to
+`SqliteStorage.open(database, options)`, `openNodeSqliteStorage(path, options)`, or
+`openDurableObjectSqliteStorage(ctx.storage, options)`. Storage renders the prefixed names into its SQL, so adapters
+need no support. A prefix must be a SQLite identifier and cannot begin with `sqlite_`; a host may reserve more, such
+as `_cf_` in Durable Objects. Changing the prefix does not migrate existing data.
+
+Multiple Pi storages opened through the Cloudflare adapter with the same storage object automatically share an
+operation queue. To share the database with host tables, create an adapter and use it for both Pi and all host queries;
+direct storage calls bypass the queue and may be rolled back with a Pi transaction:
+
+```typescript
+const database = new DurableObjectSqliteDatabase(ctx.storage);
+const piStorage = await SqliteStorage.open(database, { prefix: "pi_" });
+await database.exec("CREATE TABLE IF NOT EXISTS host_notes (text TEXT)");
+await database.run("INSERT INTO host_notes (text) VALUES (?)", text);
+```
+
 One process owns a storage at a time; there is no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
 
 SQLite adapters implement promise-based `exec`, `run`, `get`, `all`, `transaction`, and `close`. `run`, `get`, and `all` take SQL text plus positional bindings; adapters may cache prepared statements by SQL text. A transaction callback receives a transaction handle; all work in the transaction must use it, and the handle expires when the callback settles. Adapters must queue unrelated operations and other transactions until the transaction finishes, so calling `database` itself inside the callback never settles:
@@ -696,7 +719,7 @@ The package root loads TypeBox, because the tool task validates arguments with p
 Three rules decide what an error does:
 
 1. **A storage error ends the Harness.** The call that hit it rejects with the error. Everything after it, and every pending wait, rejects with `SessionFailed` (its `cause` is that error); watches and event streams end with `session_failed`; running tasks get their abort signal; `onReport` gets the error once. The Harness then closes itself. Nothing is retried; a custom storage retries its own transient failures. Reopen to recover: commits are atomic, so the store is consistent, and resubmitting with the same `requestId` finds a submission that was already admitted.
-2. **An invalid request fails only that call:** a storage throws `StorageRequestError` for a bad cursor, an unknown conversation, or history a document does not keep. A read you cancelled fails only itself too.
+2. **An invalid read fails only that call:** a storage read throws `StorageRequestError` for a bad cursor, an unknown conversation, or history a document does not keep. A read you cancelled fails only itself too. The exemption covers reads only: any error from `commit()` or `mintId()`, `StorageRequestError` included, ends the Harness as in rule 1.
 3. **Your code fails only its own unit:** a throwing task phase faults that task, a throwing tool gets an error result, a throwing hook is reported and skipped (`beforeTool` blocks the call), and a throwing commit callback rolls back that commit. Listeners that throw, or return a rejected promise, are reported and the others still run. The exception is a host `RegistryReader` whose `snapshot()` throws: the Harness cannot schedule without it, so it fails the Harness like a storage error.
 
 `harness.closed` settles once the Harness has closed, by `close()` or after a storage error, so a host restarts on failure like this:

@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Added
+
+- `settings.compaction.modelOverrides` sets compaction thresholds per model, keyed by exact `"provider/modelId"`, so one harness can serve small- and large-window models; the threshold check, overflow recovery, and the compaction task use the entry of the model they act for ([#10942](https://github.com/earendil-works/pi/issues/10942)).
+
+### Changed
+
+- `ToolControl.terminate` is now typed `boolean` instead of `true`, matching `pi-agent-core` and `pi-coding-agent`; `false` does not end the run ([#10858](https://github.com/earendil-works/pi/issues/10858)).
+
+### Fixed
+
+- The README's Errors section now limits the `StorageRequestError` exemption to reads: a `StorageRequestError` thrown by `commit()` or `mintId()` fails the Harness like any other storage error ([#11014](https://github.com/earendil-works/pi/issues/11014)).
+
+## [1.3.0] - 2026-10-15
+
+### Added
+
+- `SqliteStorage.open(database, { prefix })` can namespace every table and index; `openNodeSqliteStorage()` and `openDurableObjectSqliteStorage()` forward it, for databases shared with host tables.
+
+### Changed
+
+- Cloudflare Durable Object SQLite adapters created for the same storage object now coordinate their operations, allowing multiple Pi storages to safely share one Durable Object database.
+
 ### Fixed
 
 - The system baseline written after a compaction now leads the model context when the kept history includes an assistant message, as does a first baseline written after earlier answers, instead of following the new input; Anthropic and OpenAI Codex requests sent it as a mid-conversation system message without an initial prompt or tool set. Other system messages after an assistant message stay in place ([#10904](https://github.com/earendil-works/pi/issues/10904)).
