@@ -4,8 +4,10 @@
 //!
 //! On Windows the exec output stream (`StreamDecoder`) departs from that contract for bytes that are not valid
 //! UTF-8: legacy console programs there write in the system's ANSI code page (`systeminfo` on a Chinese Windows
-//! writes GBK), and those bytes would otherwise reach the client as replacement characters. Such runs are decoded
-//! with `MultiByteToWideChar(CP_ACP)`; valid UTF-8 runs pass through untouched, so UTF-8 output is unaffected.
+//! writes GBK), and those bytes would otherwise reach the client as replacement characters. Once a chunk of a
+//! stream fails UTF-8, the stream latches to `MultiByteToWideChar(CP_ACP)` for good — code-page byte pairs can
+//! accidentally form valid UTF-8 across pair boundaries, so per-run splitting cannot tell the two apart. Streams
+//! that stay valid UTF-8, file reads, and non-Windows platforms keep the exact TextDecoder contract.
 
 use encoding_rs::{Decoder, UTF_8};
 
@@ -17,6 +19,8 @@ pub struct StreamDecoder {
     pending: Vec<u8>,
     #[cfg(windows)]
     bom_checked: bool,
+    #[cfg(windows)]
+    latched: bool,
 }
 
 impl StreamDecoder {
@@ -28,7 +32,7 @@ impl StreamDecoder {
         }
         #[cfg(windows)]
         {
-            return StreamDecoder { pending: Vec::new(), bom_checked: false };
+            return StreamDecoder { pending: Vec::new(), bom_checked: false, latched: false };
         }
     }
 
@@ -58,32 +62,28 @@ impl StreamDecoder {
             }
             self.bom_checked = true;
         }
-        let mut out = String::new();
-        let mut rest = data;
-        while !rest.is_empty() {
-            match std::str::from_utf8(rest) {
-                Ok(text) => {
-                    out.push_str(text);
-                    rest = &[];
-                }
-                Err(error) => {
-                    let valid = error.valid_up_to();
-                    out.push_str(std::str::from_utf8(&rest[..valid]).expect("valid_up_to prefix is valid utf-8"));
-                    let invalid_end = match error.error_len() {
-                        Some(len) => valid + len,
-                        // An incomplete tail: hold it for the next chunk, unless the stream ends here.
-                        None if !last => {
-                            self.pending = rest[valid..].to_vec();
-                            return out;
-                        }
-                        None => rest.len(),
-                    };
-                    out.push_str(&decode_acp(&rest[valid..invalid_end]));
-                    rest = &rest[invalid_end..];
-                }
+        // GBK byte pairs can accidentally form valid UTF-8 across pair boundaries, so run-splitting cannot tell a
+        // code-page stream from a UTF-8 one: once a chunk fails UTF-8, the whole stream is taken to be code-page text.
+        let code_page = self.latched || std::str::from_utf8(data).is_err();
+        if !code_page {
+            return std::str::from_utf8(data).expect("just checked").to_string();
+        }
+        self.latched = true;
+        let mut end = data.len();
+        if !last {
+            // Hold back a trailing lead byte whose partner arrives with the next chunk. A run of high bytes of
+            // even length ends in a complete pair; only an odd run leaves an unpaired lead at the end.
+            let mut high = 0;
+            while high < end && data[end - 1 - high] >= 0x80 {
+                high += 1;
+            }
+            if high % 2 == 1 {
+                end -= 1;
             }
         }
-        out
+        let text = decode_acp(&data[..end]);
+        self.pending = data[end..].to_vec();
+        text
     }
 }
 
@@ -185,9 +185,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn keeps_valid_utf8_runs_untouched_between_code_page_runs() {
+    fn decodes_the_whole_chunk_in_the_code_page_once_it_fails_utf8() {
         let mut decoder = StreamDecoder::new();
         let text = decoder.decode(&[0x61, 0xc4, 0xe3, 0x62], true);
-        assert_eq!(text, format!("a{}b", decode_acp(&[0xc4, 0xe3])));
+        assert_eq!(text, decode_acp(&[0x61, 0xc4, 0xe3, 0x62]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn latches_to_the_code_page_for_the_rest_of_the_stream() {
+        let mut decoder = StreamDecoder::new();
+        assert_eq!(decoder.decode(&[0xc4, 0xe3], false), decode_acp(&[0xc4, 0xe3]));
+        // Valid UTF-8 for 你, but the stream already latched: the code page reading wins.
+        let latched = decoder.decode(&[0xe4, 0xbd, 0xa0], true);
+        assert_eq!(latched, decode_acp(&[0xe4, 0xbd, 0xa0]));
+        assert_ne!(latched, "\u{4f60}");
     }
 }
