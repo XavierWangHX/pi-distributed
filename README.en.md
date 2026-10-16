@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/upstream-pi_v1.2.0-9c27b0?style=flat-square" alt="upstream">
+  <img src="https://img.shields.io/badge/upstream-pi_v1.3.0-9c27b0?style=flat-square" alt="upstream">
   <img src="https://img.shields.io/badge/Node.js-%E2%89%A5_22.19-3c873a?style=flat-square" alt="node">
   <img src="https://img.shields.io/badge/PostgreSQL-required-336791?style=flat-square" alt="postgres">
   <img src="https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square" alt="license">
@@ -130,7 +130,7 @@ Not yet:
 
 This is a distributed experiment fork of pi, not a replacement:
 
-- Upstream code stays as-is and gets merged regularly (currently tracking v1.2.0, zero conflicts).
+- Upstream code stays as-is and gets merged regularly (currently tracking v1.3.0).
 - Almost everything new lives in new files (multi-machine routing, subagents, PG storage, machine timelines); upstream sources are barely touched.
 - Report issues with pi itself at [earendil-works/pi](https://github.com/earendil-works/pi); this repo only discusses the distributed part.
 

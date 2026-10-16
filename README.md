@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/upstream-pi_v1.2.0-9c27b0?style=flat-square" alt="upstream">
+  <img src="https://img.shields.io/badge/upstream-pi_v1.3.0-9c27b0?style=flat-square" alt="upstream">
   <img src="https://img.shields.io/badge/Node.js-%E2%89%A5_22.19-3c873a?style=flat-square" alt="node">
   <img src="https://img.shields.io/badge/PostgreSQL-required-336791?style=flat-square" alt="postgres">
   <img src="https://img.shields.io/badge/license-MIT-2f6f4e?style=flat-square" alt="license">
@@ -131,7 +131,7 @@ pi（[earendil-works/pi](https://github.com/earendil-works/pi)）的分布式实
 
 这是 pi 的分布式实验分支，不是替代品：
 
-- 上游代码原样保留，定期 merge（当前跟到 v1.2.0，零冲突）。
+- 上游代码原样保留，定期 merge（当前跟到 v1.3.0）。
 - 新增的东西基本全在新文件里（多机路由、子 agent、PG 存储、机器时间线），上游源码几乎不动。
 - pi 本身的问题去 [earendil-works/pi](https://github.com/earendil-works/pi) 提；这里只聊分布式这块。
 
