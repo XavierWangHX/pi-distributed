@@ -270,6 +270,51 @@ describe("Progress", () => {
 		expect(commits).toEqual([0, 500]);
 	});
 
+	it("paces on the clock it is given", async () => {
+		let now = 1_000;
+		const timers: { readonly delayMs: number; readonly callback: () => void; disarmed: boolean }[] = [];
+		const commits: number[] = [];
+		const progress = new Progress(
+			async () => {
+				commits.push(now);
+				return 10;
+			},
+			() => {},
+			100,
+			{
+				now: () => now,
+				setTimer: (callback, delayMs) => {
+					const timer = { delayMs, callback, disarmed: false };
+					timers.push(timer);
+					return () => {
+						timer.disarmed = true;
+					};
+				},
+			},
+		);
+		await progress.markAndWait();
+		expect(commits).toEqual([1_000]);
+		// Let the first commit finish settling.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		now = 1_040;
+		const second = progress.markAndWait();
+		expect(timers.map(({ delayMs }) => delayMs)).toEqual([60]);
+		// A timer that fires early commits nothing and waits for the rest.
+		now = 1_080;
+		timers[0]!.callback();
+		expect(commits).toEqual([1_000]);
+		expect(timers.map(({ delayMs }) => delayMs)).toEqual([60, 20]);
+		now = 1_100;
+		timers[1]!.callback();
+		await second;
+		expect(commits).toEqual([1_000, 1_100]);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		progress.mark();
+		expect(timers.map(({ delayMs }) => delayMs)).toEqual([60, 20, 100]);
+		await progress.stop();
+		expect(timers[2]!.disarmed).toBe(true);
+	});
+
 	it("rejects the waiters of a failed commit and reports its error", async () => {
 		const errors: unknown[] = [];
 		const failure = new Error("commit failed");
