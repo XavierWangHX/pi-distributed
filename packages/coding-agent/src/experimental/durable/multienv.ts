@@ -116,6 +116,7 @@ export const Machine = defineDoc<{ target: string }>({
 	history: "latest",
 	fork: "current",
 	initial: () => ({ target: "local" }),
+	checkpointWhen: () => true,
 });
 
 /** Owns the targets and every remote environment of the session, and routes the env callback. */

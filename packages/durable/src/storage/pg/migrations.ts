@@ -81,8 +81,18 @@ const INITIAL_SCHEMA: readonly string[] = [
 	"CREATE INDEX document_revisions_by_kind ON document_revisions (document_id, kind, seq DESC)",
 ];
 
+/** PostgreSQL dialect of the SQLite schema's version 2: sleeping tasks. PostgreSQL alters the check in place. */
+const SLEEPING_TASK_STATUS: readonly string[] = [
+	"ALTER TABLE tasks DROP CONSTRAINT tasks_status_check",
+	`ALTER TABLE tasks ADD CONSTRAINT tasks_status_check
+		CHECK (status IN ('pending', 'running', 'waiting', 'sleeping', 'completing', 'terminal'))`,
+];
+
 /** Immutable, ordered PostgreSQL schema history; version numbers track the SQLite schema's. */
-export const PG_MIGRATIONS: readonly SqliteMigration[] = [{ version: 1, statements: INITIAL_SCHEMA }];
+export const PG_MIGRATIONS: readonly SqliteMigration[] = [
+	{ version: 1, statements: INITIAL_SCHEMA },
+	{ version: 2, statements: SLEEPING_TASK_STATUS },
+];
 
 type SchemaRow = { readonly version: number };
 

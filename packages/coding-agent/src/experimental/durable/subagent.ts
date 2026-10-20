@@ -62,6 +62,7 @@ export const Subagents = defineDoc<{ entries: Record<string, SubagentEntry> }>({
 	version: 1,
 	scope: "session",
 	initial: () => ({ entries: {} }),
+	checkpointWhen: () => true,
 });
 
 /** Cumulative background spawns per session: a runaway loop must not flood the cluster. */
