@@ -1,4 +1,4 @@
-import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
+import { type Context, copyJson, type Draft } from "@earendil-works/chord";
 import type {
 	Api,
 	AssistantMessage,
@@ -21,7 +21,6 @@ import type {
 	EntryId,
 	NextTaskState,
 	SubmissionId,
-	SubmissionSettlement,
 	TaskId,
 	TaskOutcome,
 	TaskRuntime,
@@ -30,9 +29,19 @@ import type {
 } from "../types.ts";
 import { addTools, sectionExtension } from "./agent.ts";
 import { compactionPolicy, createCompaction, estimateContext, selectCut } from "./compaction.ts";
-import { applyBoundary, type Boundary, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";
-import { assignJson } from "./json.ts";
-import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
+import { applyBoundary, type Boundary, hasQueuedReset, prepareBoundary, withdrawQueuedInputs } from "./inbox.ts";
+import {
+	cutOffCount,
+	cutOffTooOften,
+	endRun,
+	LiveDoc,
+	type LiveState,
+	PROGRESS_COMMIT,
+	type RunEnd,
+	salvageable,
+	type ToolSlot,
+} from "./live.ts";
+import { PartialChanges, type PartialMessage } from "./partial-changes.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { ensureProviderSessionId } from "./provider.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
@@ -75,12 +84,24 @@ export type GenerationCheckpoint =
 			/** Newest entry included in the request. */
 			cutoff: EntryId;
 	  }
-	| { phase: "retry"; attempt: number; compacted?: TaskId<CompactionResult>; until: number }
+	| {
+			phase: "retry";
+			attempt: number;
+			compacted?: TaskId<CompactionResult>;
+			until: number;
+			/**
+			 * The deferred response a poll was fetching when the host died: the next attempt polls it again instead of
+			 * sending another request, so the provider's job is neither lost nor paid twice. Absent otherwise.
+			 */
+			poll?: { model: ModelRef; thinkingLevel?: ModelThinkingLevel; cutoff: EntryId; handle: DeferredHandle };
+	  }
 	| {
 			phase: "poll";
 			attempt: number;
 			compacted?: TaskId<CompactionResult>;
 			model: ModelRef;
+			/** Absent in checkpoints of earlier versions. */
+			thinkingLevel?: ModelThinkingLevel;
 			cutoff: EntryId;
 			handle: DeferredHandle;
 			pollAt: number;
@@ -106,6 +127,7 @@ type Request = {
 	readonly attempt: number;
 	readonly compacted: TaskId<CompactionResult> | undefined;
 	readonly model: ModelRef;
+	readonly thinkingLevel: ModelThinkingLevel | undefined;
 	readonly cutoff: EntryId;
 	/** Committed model context through `cutoff`, when the phase already derived it. */
 	readonly messages?: readonly Message[];
@@ -121,8 +143,15 @@ const DEFAULT_POLL_AFTER_MS = 5000;
  */
 export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, GenerationResult, GenerationHooks>({
 	name: "pi.generation",
-	version: 1,
+	version: 2,
 	initial: () => ({ phase: "prepare", attempt: 1 }),
+	// Version 2 leaves calls to tools not offered in a sequential round's `pending`, flagged `unoffered` in their slots.
+	// A version 1 Harness would start their tool tasks unflagged, resolving the name, so it leaves version 2 blocked
+	// instead. A version 1 checkpoint has no such calls and is kept as it is.
+	migrate: (input, checkpoint) => ({
+		input: input as GenerationInput,
+		checkpoint: checkpoint as GenerationCheckpoint,
+	}),
 	phases: {
 		/**
 		 * Render the system prompt and tool loadout and append the positional `pi.system` entries they need, then move to
@@ -131,6 +160,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		 * may land meanwhile.
 		 */
 		prepare: async (task, runtime, context) => {
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
 			const { conversationId } = runtime;
 			const agent = await runtime.agent(context);
 			const settings = runtime.settings;
@@ -153,13 +183,18 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				}
 			}
 			const view = await runtime.context(conversationId, context);
+			// The model owes an answer only to a context ending in a user message or tool results; system messages say
+			// nothing it answers. Otherwise, as for a continue after an answer or in an empty conversation, end the run
+			// before any request.
+			const last = view.messages.findLast((message) => message.role !== "system");
+			if (last?.role !== "user" && last?.role !== "toolResult") return failNothingToAnswer(runtime, context);
 			const shown = replaySections(view.messages);
 			let env: ExecutionEnv | undefined;
 			try {
 				env = await runtime.env(context);
 			} catch (error) {
 				if (context.abortSignal?.aborted) throw error;
-				runtime.report(error, { type: "host", callback: "env" });
+				runtime.report(error, { kind: "host", callback: "env" });
 			}
 			const input: PromptInput = { conversationId, agent, env, shown: Object.fromEntries(shown), read: runtime };
 			const desired = await renderSections(
@@ -168,7 +203,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				shown,
 				(error, section) =>
 					runtime.report(error, {
-						type: "extension",
+						kind: "extension",
 						...optionalExtension(sectionExtension(agent, section.key)),
 					}),
 				context,
@@ -188,9 +223,9 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				return;
 			}
 			await runtime.commit(async (tx) => {
-				let cutoff = (await tx.scanEntries({ conversationId }, 1)).items[0]?.id;
+				// The context ends in a message the model answers, so the conversation has an entry.
+				let cutoff = (await tx.scanEntries({ conversationId }, 1)).items[0]!.id;
 				for (const entry of entries) cutoff = (await tx.appendEntry(SystemEntry, conversationId, entry)).id;
-				if (cutoff === undefined) throw new Error(`Conversation ${conversationId} has no entries to send`);
 				// Checked in this commit, so a compaction admitted during preparation counts.
 				if (threshold === "background" && (await tx.doc(LiveDoc, conversationId)).compactions === undefined) {
 					await createCompaction(tx, conversationId, { reason: "threshold" });
@@ -207,6 +242,10 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			}, context);
 		},
 		request: async (task, runtime, context) => {
+			// Charging the attempt may itself be what keeps failing, such as converting a huge partial: the limit ends it.
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
+			// The host stopped while this request was in flight: a failed attempt, not a resend (spec §8.3).
+			if (task.restarts !== undefined) return interrupted(runtime, task.state.checkpoint, context);
 			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
 			const conversationId = runtime.conversationId;
 			await runtime.commit(async (tx) => {
@@ -231,26 +270,37 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
 			const message = await streamResponse(runtime, model, messages, options, attempt, context);
-			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
+			const request = { attempt, compacted, model: ref, thinkingLevel, cutoff, messages: view.messages };
 			await classify(runtime, request, message, context);
 		},
 		/** After the backoff's sleep; a run before `until` (an early wake, or a record of an earlier version) sleeps again. */
 		retry: async (task, runtime, context) => {
-			const { attempt, compacted, until } = task.state.checkpoint;
+			const { attempt, compacted, until, poll } = task.state.checkpoint;
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
 			if (until > runtime.now()) return runtime.sleepUntil(until, task.state.checkpoint, context);
 			await runtime.commit(async (tx) => {
-				(await tx.doc(LiveDoc, runtime.conversationId)).generation = { attempt: attempt + 1 };
-				const checkpoint: GenerationCheckpoint = {
-					phase: "prepare",
-					attempt: attempt + 1,
-					...(compacted === undefined ? {} : { compacted }),
-				};
-				return { status: "running", checkpoint };
+				const live = await tx.doc(LiveDoc, runtime.conversationId);
+				const kept = compacted === undefined ? {} : { compacted };
+				// A poll the host died during polls its response again, as the next attempt.
+				if (poll !== undefined) {
+					const pollAt = runtime.now();
+					live.generation = { attempt: attempt + 1, deferred: { pollAt } };
+					return {
+						status: "running",
+						checkpoint: { phase: "poll", attempt: attempt + 1, ...kept, ...poll, pollAt },
+					};
+				}
+				live.generation = { attempt: attempt + 1 };
+				return { status: "running", checkpoint: { phase: "prepare", attempt: attempt + 1, ...kept } };
 			}, context);
 		},
 		/** After the sleep until `pollAt`; a run before it (an early wake, or a record of an earlier version) sleeps again. */
 		poll: async (task, runtime, context) => {
-			const { attempt, compacted, model: ref, cutoff, handle, pollAt } = task.state.checkpoint;
+			const { attempt, compacted, model: ref, thinkingLevel, cutoff, handle, pollAt } = task.state.checkpoint;
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
+			// The host stopped while the poll's fetch was in flight: a failed attempt, as for a request. Checked before the
+			// time, which may have moved backwards on a replacement host; a sleeping poll is never cut off.
+			if (task.restarts !== undefined) return interrupted(runtime, task.state.checkpoint, context);
 			if (pollAt > runtime.now()) return runtime.sleepUntil(pollAt, task.state.checkpoint, context);
 			const model = runtime.models.getModel(ref.provider, ref.modelId);
 			if (model === undefined) return failNoModel(runtime, ref, context);
@@ -258,18 +308,19 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				signal: runtime.signal,
 				telemetry: context.telemetry,
 			});
-			const request = { attempt, compacted, model: ref, cutoff, pollAt };
+			const request = { attempt, compacted, model: ref, thinkingLevel, cutoff, pollAt };
 			await classify(runtime, request, message, context);
 		},
 		tools: async (task, runtime, context) => {
+			if (cutOffTooOften(task, runtime)) return endCutOff(runtime, task, context);
 			const { assistant, tools, pending } = task.state.checkpoint;
 			const [next, ...rest] = pending;
 			if (next === undefined) return finishToolRound(runtime, assistant, tools, context);
 			// Sequential round: start the next call and wait for it.
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				const taskId = await createToolTask(tx, runtime, assistant, next);
 				const slot = live.tools?.find((slot) => slot.callId === next && slot.taskId === undefined);
+				const taskId = await createToolTask(tx, runtime, assistant, next, slot?.unoffered);
 				if (slot !== undefined) slot.taskId = taskId;
 				const checkpoint: GenerationCheckpoint = {
 					phase: "tools",
@@ -283,21 +334,11 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 	},
 	abort: async (task, runtime, context) => {
 		const checkpoint = task.state.checkpoint;
-		if (checkpoint.phase === "poll") {
-			const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
-			if (model !== undefined) {
-				try {
-					await runtime.models.cancelDeferred(model, checkpoint.handle, {
-						signal: runtime.signal,
-						telemetry: context.telemetry,
-					});
-				} catch (error) {
-					runtime.report(error, { type: "host", callback: "models" });
-				}
-			}
-		}
+		const polled = deferredOf(checkpoint);
+		if (polled !== undefined) await cancelDeferred(runtime, polled, context);
 		const conversationId = runtime.conversationId;
-		// Runs after the round's tool tasks are terminal; calls never started get `aborted` results (spec §8.5).
+		// Runs after the round's tool tasks are terminal; calls never started get `aborted` results (spec §8.5), unoffered
+		// ones `tool_unavailable`.
 		const unstarted =
 			checkpoint.phase === "tools"
 				? await readCalls(runtime, checkpoint.assistant, checkpoint.pending, context)
@@ -306,7 +347,11 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 			const live = await tx.doc(LiveDoc, conversationId);
 			await convertPartial(tx, live, conversationId);
 			for (const call of unstarted) {
-				const result = harnessError("aborted", `Tool ${call.name} was aborted`);
+				// A call its request did not offer could not have run either way.
+				const unoffered = live.tools?.find((slot) => slot.callId === call.id)?.unoffered === true;
+				const result = unoffered
+					? harnessError("tool_unavailable", `Tool ${call.name} is not available`)
+					: harnessError("aborted", `Tool ${call.name} was aborted`);
 				await appendToolResult(tx, conversationId, call, result, { timestamp: runtime.now() });
 			}
 			endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "aborted" });
@@ -327,11 +372,17 @@ async function readCalls(
 	return callIds.flatMap((id) => calls.filter((call) => call.id === id).slice(0, 1));
 }
 
-/** A tool task for call `callId`, owned by the generation. */
-function createToolTask(tx: Tx, runtime: Runtime, assistant: EntryId, callId: string): Promise<TaskId<ToolTaskResult>> {
+/** A tool task for call `callId`, owned by the generation; `unoffered` for a call to a tool its request did not offer. */
+function createToolTask(
+	tx: Tx,
+	runtime: Runtime,
+	assistant: EntryId,
+	callId: string,
+	unoffered: true | undefined,
+): Promise<TaskId<ToolTaskResult>> {
 	return tx.createTask(
 		ToolTask,
-		{ kind: "model", assistant, callId },
+		{ kind: "model", assistant, callId, ...(unoffered === undefined ? {} : { unoffered }) },
 		{ ownership: { kind: "task", taskId: runtime.taskId } },
 	);
 }
@@ -386,6 +437,109 @@ async function failModelError(runtime: Runtime, text: string, context: Context):
 	}, context);
 }
 
+/**
+ * The host stopped while this attempt's request or poll was in flight (`TaskRecord.restarts`): a failed attempt under
+ * `settings.retry` (spec §8.3). The committed partial becomes an aborted entry; the next attempt follows the backoff, a
+ * poll's by polling its deferred response again, or, with no retry left, the run ends `interrupted`.
+ */
+async function interrupted(
+	runtime: Runtime,
+	checkpoint: Extract<GenerationCheckpoint, { phase: "request" | "poll" }>,
+	context: Context,
+): Promise<void> {
+	const { attempt, compacted } = checkpoint;
+	const policy = runtime.settings.retry;
+	const retry = policy.enabled && attempt <= policy.maxRetries;
+	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
+	const polled = checkpoint.phase === "poll" ? checkpoint : undefined;
+	const text =
+		polled === undefined
+			? `The host stopped while the model was answering, on attempt ${attempt}`
+			: `The host stopped while the deferred answer was fetched, on attempt ${attempt}`;
+	// A run that ends does not leave the provider's job running.
+	if (!retry && polled !== undefined) await cancelDeferred(runtime, polled, context);
+	await runtime.commit(async (tx): Promise<Next> => {
+		// Read before the first table write; only a failure uses it.
+		const failure = retry ? undefined : await prepareFailure(tx, runtime);
+		const live = await tx.doc(LiveDoc, runtime.conversationId);
+		await convertPartial(tx, live, runtime.conversationId);
+		if (failure === undefined) {
+			live.generation = { attempt, retry: { at: until, error: text } };
+			const poll =
+				polled === undefined
+					? {}
+					: {
+							poll: {
+								model: polled.model,
+								...(polled.thinkingLevel === undefined ? {} : { thinkingLevel: polled.thinkingLevel }),
+								cutoff: polled.cutoff,
+								handle: polled.handle,
+							},
+						};
+			const next = { phase: "retry", attempt, ...(compacted === undefined ? {} : { compacted }), until, ...poll };
+			return { status: "sleeping", checkpoint: next as GenerationCheckpoint, until };
+		}
+		await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "interrupted", detail: text });
+		return {
+			status: "terminal",
+			outcome: { status: "failed", error: { message: text, detail: { reason: "interrupted" } } },
+		};
+	}, context);
+}
+
+/**
+ * End a run whose generation was cut off `settings.restartLimit` times in a row (spec §5.4). At the limit it still
+ * keeps a committed partial as an aborted entry and cancels a deferred response it polled; past the limit that cleanup
+ * may be what cut it off, so it ends without it.
+ */
+async function endCutOff(
+	runtime: Runtime,
+	task: { readonly restarts?: number; readonly state: { readonly checkpoint: GenerationCheckpoint } },
+	context: Context,
+): Promise<void> {
+	const checkpoint = task.state.checkpoint;
+	const text = `The generation was interrupted ${cutOffCount(task)} in its ${checkpoint.phase} phase`;
+	const salvage = salvageable(task, runtime);
+	const polled = deferredOf(checkpoint);
+	if (salvage && polled !== undefined) await cancelDeferred(runtime, polled, context);
+	await runtime.commit(async (tx): Promise<Next> => {
+		const failure = await prepareFailure(tx, runtime);
+		const live = await tx.doc(LiveDoc, runtime.conversationId);
+		if (salvage) await convertPartial(tx, live, runtime.conversationId);
+		await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "restart_limit", detail: text });
+		return {
+			status: "terminal",
+			outcome: { status: "failed", error: { message: text, detail: { reason: "restart_limit" } } },
+		};
+	}, context);
+}
+
+/** The deferred response a checkpoint polls, or will poll again after a retry's backoff. */
+function deferredOf(
+	checkpoint: GenerationCheckpoint,
+): { readonly model: ModelRef; readonly handle: DeferredHandle } | undefined {
+	if (checkpoint.phase === "poll") return checkpoint;
+	return checkpoint.phase === "retry" ? checkpoint.poll : undefined;
+}
+
+/** Cancel a deferred response no attempt will poll again; a failure is reported, never thrown. */
+async function cancelDeferred(
+	runtime: Runtime,
+	checkpoint: { readonly model: ModelRef; readonly handle: DeferredHandle },
+	context: Context,
+): Promise<void> {
+	const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
+	if (model === undefined) return;
+	try {
+		await runtime.models.cancelDeferred(model, checkpoint.handle, {
+			signal: runtime.signal,
+			telemetry: context.telemetry,
+		});
+	} catch (error) {
+		runtime.report(error, { kind: "host", callback: "models" });
+	}
+}
+
 /** Settle the run's inputs `unanswered` with `no_model` and fail. */
 async function failNoModel(runtime: Runtime, ref: ModelRef | undefined, context: Context): Promise<void> {
 	const message =
@@ -393,8 +547,25 @@ async function failNoModel(runtime: Runtime, ref: ModelRef | undefined, context:
 	await runtime.commit(async (tx) => {
 		const failure = await prepareFailure(tx, runtime);
 		const live = await tx.doc(LiveDoc, runtime.conversationId);
-		await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "no_model" });
+		await endFailedRun(tx, runtime, live, failure, {
+			status: "unanswered",
+			reason: "no_model",
+			detail: message,
+			settlement: { status: "unanswered", reason: "no_model" },
+		});
 		return { status: "terminal", outcome: { status: "failed", error: { message, detail: { reason: "no_model" } } } };
+	}, context);
+}
+
+/** End the run without a request: its context has nothing the model would answer. */
+async function failNothingToAnswer(runtime: Runtime, context: Context): Promise<void> {
+	const message = "The conversation has nothing to answer";
+	await runtime.commit(async (tx) => {
+		const failure = await prepareFailure(tx, runtime);
+		const live = await tx.doc(LiveDoc, runtime.conversationId);
+		await endFailedRun(tx, runtime, live, failure, { status: "unanswered", reason: "nothing_to_answer" });
+		const error = { message, detail: { reason: "nothing_to_answer" } };
+		return { status: "terminal", outcome: { status: "failed", error } };
 	}, context);
 }
 
@@ -417,14 +588,14 @@ async function endFailedRun(
 	runtime: Runtime,
 	live: Draft<LiveState>,
 	failure: Failure,
-	settlement: SubmissionSettlement,
+	end: Extract<RunEnd, { status: "unanswered" }>,
 ): Promise<void> {
 	const conversationId = runtime.conversationId;
-	endRun(tx, live, runtime.taskId, settlement);
+	endRun(tx, live, runtime.taskId, end);
 	if (failure.policy === "withdraw") await withdrawQueuedInputs(tx, conversationId, "run_failed");
 	if (failure.boundary === undefined) return;
 	const { users } = await applyBoundary(tx, failure.boundary, "final", runtime.now());
-	if (users.length > 0) await startRun(tx, conversationId, live, users);
+	if (users.length > 0) await startRun(tx, conversationId, live, users, { keepFailure: true });
 }
 
 /**
@@ -440,8 +611,10 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
- * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle and awaits that
- * commit, so no stale partial lands after the outcome.
+ * `progress.partialIntervalMs` (default 100 ms) with one commit in flight, deferred (`PROGRESS_COMMIT`); `finally` stops
+ * the throttle and awaits that commit, so no stale partial lands after the outcome. A commit appends what text and
+ * thinking grew by and applies the argument changes since the last one (`PartialChanges`), so its cost follows the new
+ * text, not the strings' length.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -456,20 +629,32 @@ async function streamResponse(
 	let timer: (() => void) | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
+	const changes = new PartialChanges();
 	const flush = (): void => {
 		timer = undefined;
 		const partial = pending;
 		pending = undefined;
 		if (partial === undefined || stopped) return;
 		inFlight = (async () => {
-			// Copy synchronously: the provider keeps mutating its partial.
-			const message = copyJson(partial, { omitUndefinedProperties: true });
-			await runtime.commit(async (tx) => {
-				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				live.generation ??= { attempt };
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-				return undefined;
-			}, context);
+			// Copy synchronously: the provider keeps mutating its partial. The changes since the last commit belong to it.
+			// `copyJson()` returns untyped JSON; a copy of a message is that message's JSON representation.
+			const message = copyJson(partial, { omitUndefinedProperties: true }) as PartialMessage;
+			const taken = changes.take(message);
+			try {
+				await runtime.commit(
+					async (tx) => {
+						const live = await tx.doc(LiveDoc, runtime.conversationId);
+						live.generation ??= { attempt };
+						changes.commit(live.generation, message, taken);
+						return undefined;
+					},
+					context,
+					PROGRESS_COMMIT,
+				);
+			} catch (error) {
+				changes.restore(taken);
+				throw error;
+			}
 		})()
 			.catch((error: unknown) => {
 				// Rejections after an abort mark or close are expected; the committed state stays consistent.
@@ -486,6 +671,7 @@ async function streamResponse(
 			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
+			changes.observe(event);
 			pending = event.partial;
 			if (timer === undefined && inFlight === undefined) timer = runtime.setTimer(flush, interval);
 		}
@@ -507,7 +693,9 @@ async function classify(
 	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
 	runtime.signal.throwIfAborted();
 	const conversationId = runtime.conversationId;
-	const { attempt, compacted, model: ref, cutoff } = request;
+	const { attempt, compacted, model: ref, thinkingLevel, cutoff } = request;
+	// Record the requested level, as pi-agent-core's agent loop does.
+	if (thinkingLevel !== undefined) message.thinkingLevel = thinkingLevel;
 	if (message.stopReason === "deferred" && message.deferred !== undefined) {
 		const handle = message.deferred;
 		const pollAt = Math.max(
@@ -521,6 +709,7 @@ async function classify(
 				attempt,
 				...(compacted === undefined ? {} : { compacted }),
 				model: ref,
+				...(thinkingLevel === undefined ? {} : { thinkingLevel }),
 				cutoff,
 				handle,
 				pollAt,
@@ -607,10 +796,13 @@ async function answer(runtime: Runtime, message: AssistantMessage, context: Cont
 		const live = await tx.doc(LiveDoc, conversationId);
 		const entry = await appendAssistant(tx, conversationId, message);
 		const result: Next = { status: "terminal", outcome: { status: "completed", result: { entryId: entry.id } } };
-		const { users, reset } = await applyBoundary(tx, boundary, "final", runtime.now());
-		if (continuation !== undefined && users.length === 0 && !reset) {
-			const user = { role: "user", content: continuation, timestamp: runtime.now() } as const;
+		const continues = takesContinuation(continuation, boundary) ? continuation : undefined;
+		const { users } = await applyBoundary(tx, boundary, "final", runtime.now());
+		if (continues !== undefined) {
+			const user = { role: "user", content: continues, timestamp: runtime.now() } as const;
 			await tx.appendEntry(UserEntry, conversationId, { model: [user] });
+			// The continuation starts the run's turn count over: bounding `onYield` loops is the extension's job.
+			if (live.run?.taskId === runtime.taskId) live.run.turns = 0;
 			handOver(live, runtime.taskId, await createGeneration(tx, conversationId));
 			delete live.generation;
 			return result;
@@ -622,9 +814,24 @@ async function answer(runtime: Runtime, message: AssistantMessage, context: Cont
 }
 
 /**
- * Append the tool-calling answer and start its tool round in one commit (spec §8.3). A call to a tool the request did
- * not offer gets its `tool_unavailable` result here; every other call gets a tool task owned by the generation, only the
- * first one now when the round is sequential. The generation then waits for them in its `tools` phase, keeping the run.
+ * Whether an answer's `onYield` continuation is taken (spec §8.3), decided from the inbox before the final boundary
+ * places anything: only when it holds no user item, of which the boundary would select one, and no reset, which would
+ * otherwise run first. A continuation starts the turn count over.
+ */
+function takesContinuation(continuation: UserInput | undefined, boundary: Boundary): continuation is UserInput {
+	const items = boundary.inbox.items;
+	return (
+		continuation !== undefined &&
+		!items.some((item) => item.mode === "steer" || item.mode === "followUp") &&
+		!hasQueuedReset(items)
+	);
+}
+
+/**
+ * Append the tool-calling answer and start its tool round in one commit (spec §8.3). Every call gets a tool task owned by
+ * the generation, in call order, only the first one now when the round is sequential; a call to a tool the request did
+ * not offer is flagged, and its task settles `tool_unavailable`. The generation then waits for them in its `tools`
+ * phase, keeping the run.
  */
 async function startToolRound(
 	runtime: Runtime,
@@ -652,31 +859,30 @@ async function startToolRound(
 		const tools: TaskId<ToolTaskResult>[] = [];
 		const pending: string[] = [];
 		for (const call of calls) {
-			if (!offered.has(call.name)) {
-				const unavailable = harnessError("tool_unavailable", `Tool ${call.name} is not available`);
-				const result = await appendToolResult(tx, conversationId, call, unavailable, { timestamp: runtime.now() });
-				slots.push({ callId: call.id, name: call.name, status: "done", entry: result.id });
-				continue;
-			}
+			const unoffered = offered.has(call.name) ? {} : ({ unoffered: true } as const);
 			if (sequential && tools.length > 0) {
 				pending.push(call.id);
-				slots.push({ callId: call.id, name: call.name, status: "pending" });
+				slots.push({ callId: call.id, name: call.name, status: "pending", ...unoffered });
 				continue;
 			}
-			const taskId = await createToolTask(tx, runtime, entry.id, call.id);
+			const taskId = await createToolTask(tx, runtime, entry.id, call.id, unoffered.unoffered);
 			tools.push(taskId);
-			slots.push({ callId: call.id, name: call.name, taskId, status: "pending" });
+			slots.push({ callId: call.id, name: call.name, taskId, status: "pending", ...unoffered });
 		}
 		delete live.generation;
 		live.tools = slots;
+		// A tool round is one turn of the run (`AgentState.maxTurns`).
+		if (live.run?.taskId === runtime.taskId) live.run.turns += 1;
 		const checkpoint = { phase: "tools", assistant: entry.id, tools, pending } as const;
 		return { status: "waiting", checkpoint, on: tools, policy: "allSettled" };
 	}, context);
 }
 
 /**
- * The round's tools are terminal: apply their controls and either end the run at the final boundary (`terminate`,
- * `handoff`, or a queued reset) or hand it to the next generation at the `postTools` boundary (spec §8.5).
+ * The round's tools are terminal: apply their controls, append a `handoff`'s reset, and then end the run at the final
+ * boundary (`terminate`), end it like a failure at the conversation's turn limit (`turn_limit`), end it at a queued
+ * reset, or hand it to the next generation at the `postTools` boundary, in the handoff's new context when there is one
+ * (spec §8.5).
  */
 async function finishToolRound(
 	runtime: Runtime,
@@ -698,33 +904,47 @@ async function finishToolRound(
 	const slots = (await runtime.snapshot(LiveDoc, conversationId, context))?.tools ?? [];
 	const results = slots.flatMap((slot) => (slot.entry === undefined ? [] : [slot.entry]));
 	await runtime.hooks.each("afterTools", (hook) => hook(assistant, results, runtime, context));
-	// Every call of the round, including those answered without a task, must ask to terminate.
-	const terminate =
-		slots.length > 0 &&
-		slots.every((slot) => slot.taskId !== undefined && controls.get(slot.taskId)?.terminate === true);
-	const added = [...controls.values()].flatMap((control) => control?.addTools ?? []);
+	// In call order, the slots' order; a slot without a task (faulted or orphaned before it got one) has no control.
+	const ordered = slots.map((slot) => (slot.taskId === undefined ? undefined : controls.get(slot.taskId)));
+	// Every call of the round must ask to terminate.
+	const terminate = slots.length > 0 && ordered.every((control) => control?.terminate === true);
+	const added = ordered.flatMap((control) => control?.addTools ?? []);
 	// The last handoff in call order wins.
-	const handoff = [...controls.values()].findLast((control) => control?.handoff !== undefined)?.handoff;
+	const handoff = ordered.findLast((control) => control?.handoff !== undefined)?.handoff;
+	// Read from the phase's agent, as every agent field; a `configure()` during the round applies at its end.
+	const maxTurns = (await runtime.agent(context)).maxTurns;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const boundary = await prepareBoundary(tx, conversationId, runtime.settings);
 		if (added.length > 0) await addTools(tx, conversationId, added);
 		const live = await tx.doc(LiveDoc, conversationId);
 		const now = runtime.now();
-		if (terminate || handoff !== undefined) {
-			if (handoff !== undefined) {
-				const message = { role: "user", content: handoff, timestamp: now } as const;
-				const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
-				boundary.head = entry.id;
-			}
+		if (handoff !== undefined) {
+			// The handoff's reset precedes every queued item, so queued writes and selected steers land in its context.
+			const message = { role: "user", content: handoff, timestamp: now } as const;
+			const entry = await tx.appendEntry(ResetEntry, conversationId, { head: "self", model: [message] });
+			boundary.head = entry.id;
+		}
+		const turns = live.run?.taskId === runtime.taskId ? live.run.turns : 0;
+		if (terminate) {
 			const { users } = await applyBoundary(tx, boundary, "final", now);
 			endRun(tx, live, runtime.taskId, { status: "done", answer: assistant });
 			if (users.length > 0) await startRun(tx, conversationId, live, users);
+		} else if (maxTurns !== undefined && turns >= maxTurns) {
+			// The turn limit ends the run like a failure: `afterFailedRun` decides the queued items, and a continue resumes
+			// it on the round's results. The table was read for the boundary already, before any write.
+			const policy = runtime.settings.afterFailedRun;
+			const failure = { policy, ...(policy === "continue" ? { boundary } : {}) };
+			await endFailedRun(tx, runtime, live, failure, {
+				status: "unanswered",
+				reason: "turn_limit",
+				detail: turns === 1 ? "1 turn" : `${turns} turns`,
+			});
 		} else {
 			const { users, reset } = await applyBoundary(tx, boundary, "postTools", now);
 			if (reset) {
 				// The queued reset cut the run's context before an answer.
 				endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "reset" });
-				if (users.length > 0) await startRun(tx, conversationId, live, users);
+				if (users.length > 0) await startRun(tx, conversationId, live, users, { keepFailure: true });
 			} else {
 				delete live.tools;
 				delete live.nestedTools;
@@ -749,14 +969,19 @@ async function appendAssistant(
 	return tx.appendEntry(AssistantEntry, conversationId, { model: [message] });
 }
 
-/** Start a run for `inputs`, placed input submissions: a new generation takes `pi.live.run`. */
+/**
+ * Start a run for `inputs`, placed input submissions: a new generation takes `pi.live.run`. Removes `runFailure`, unless
+ * `keepFailure`: a run started in the commit that ended the failed one keeps its failure.
+ */
 export async function startRun(
 	tx: Tx,
 	conversationId: ConversationId,
 	live: Draft<LiveState>,
 	inputs: SubmissionId[],
+	options?: { readonly keepFailure?: boolean },
 ): Promise<void> {
-	live.run = { taskId: await createGeneration(tx, conversationId, { submissionIds: inputs }), inputs };
+	live.run = { taskId: await createGeneration(tx, conversationId, { submissionIds: inputs }), inputs, turns: 0 };
+	if (options?.keepFailure !== true) delete live.runFailure;
 }
 
 /** A generation owned by its conversation. */

@@ -4,16 +4,83 @@
 
 ### Added
 
-- Added a Models Configuration reference generated from the `models.json` schema, listing all provider, model, model override, and compatibility fields ([#10790](https://github.com/earendil-works/pi/issues/10790))
+- Extension packages can now show their changelog after an update. Pi reads `pi.changelogPath` from the package's `package.json`, or `CHANGELOG.md` in the package root, and on the next fresh launch shows entries newer than the last seen version under "Extension Updates". The `collapseChangelog` setting condenses this to one line per package ([#5958](https://github.com/earendil-works/pi/issues/5958), [#8790](https://github.com/earendil-works/pi/pull/8790))
+- Device-code login (for example GitHub Copilot) now opens the verification page and copies the code when you press Enter. Providers can turn either action off with `openBrowserOnConfirm: false` or `copyCodeOnConfirm: false` ([#9282](https://github.com/earendil-works/pi/issues/9282), [#9301](https://github.com/earendil-works/pi/pull/9301))
 
 ### Changed
 
+- `pi update` for installs from the pi.dev installer no longer passes `--min-release-age=0` to `npm ci`. The release lockfile pins every package, so the flag had no effect, and security scanners that block it stopped the update ([#11262](https://github.com/earendil-works/pi/issues/11262))
+- `/model` and `/scoped-models` now show a model's name next to its ID when the name adds words the ID lacks, such as a renamed `models.json` override ([#5916](https://github.com/earendil-works/pi/issues/5916), [#11347](https://github.com/earendil-works/pi/pull/11347))
+
+### Fixed
+
+- Fixed a redundant system prompt update (tools, rules) when an extension set the same active tools in a different order, for example a reversed `pi.setActiveTools()` list. Tools that stay active now keep their order and newly activated tools are appended ([#11495](https://github.com/earendil-works/pi/issues/11495))
+- Fixed `pi install` and `pi remove` adding ever deeper nested entries to the npm `package-lock.json` when the agent directory is reached through a symlink, such as `~/.pi` linked into a dotfiles repo. pi now passes the resolved real path to npm ([#11358](https://github.com/earendil-works/pi/issues/11358))
+- MCP sign-in now rejects authorization endpoints and other OAuth metadata URLs that are not `http:` or `https:`. Before, a malicious MCP server could supply a `file:` or custom protocol URL, which pi passed to the platform URL handler.
+- Automatic `fd` and `rg` downloads no longer fetch x86-64 binaries on ARM32 and other architectures without a prebuilt release. pi now warns and recommends installing the tool with the system package manager ([#11209](https://github.com/earendil-works/pi/issues/11209))
+- Fixed `/model` search ranking letters scattered over an earlier part of an entry above a real match, for example `opus` listing `gpt-oss-120b` and `claude-sonnet-4.5` before `claude-opus-4.1` ([#11220](https://github.com/earendil-works/pi/issues/11220), [#11296](https://github.com/earendil-works/pi/pull/11296))
+- Fixed `/resume` search matching scattered letters anywhere in session messages and IDs, for example `1024` matching inside a session UUID. Session names and working directories still match fuzzily; IDs and message text now match only as exact substrings ([#11220](https://github.com/earendil-works/pi/issues/11220), [#11024](https://github.com/earendil-works/pi/issues/11024), [#11296](https://github.com/earendil-works/pi/pull/11296))
+- Fixed HTML export showing a blank page for sessions with thousands of entries ([#11225](https://github.com/earendil-works/pi/issues/11225), [#11293](https://github.com/earendil-works/pi/pull/11293))
+- Fixed HTML export not showing system messages: the system prompt and tools, and later section updates such as after `/reload`. `pi --export` now includes the system prompt and tools too ([#11261](https://github.com/earendil-works/pi/issues/11261), [#3464](https://github.com/earendil-works/pi/issues/3464), [#11290](https://github.com/earendil-works/pi/pull/11290))
+- Fixed aborting a bash command on macOS sometimes running the next command of a list such as `long_step; next_step`. pi now stops the process group before killing it ([#11252](https://github.com/earendil-works/pi/issues/11252), [#11289](https://github.com/earendil-works/pi/pull/11289))
+- Fixed streamed tool calls re-running their call renderer on every argument delta; the interactive mode now renders the latest arguments once per frame, so a large streamed `write` no longer re-highlights its whole content per delta ([#9265](https://github.com/earendil-works/pi/issues/9265))
+- Fixed the login dialog opening sign-in URLs that are not web URLs, and printing control characters from sign-in, device-code, and info URLs, which could end a terminal hyperlink and send escape sequences to the terminal
+
+## [1.4.0] - 2026-10-21
+
+### New Features
+
+- **Image input for classifiers**: codemode `models.classify()` accepts `images` for TypeSafe's Jev and Cloudflare's Clef models on `typesafe`, `cloudflare-workers-ai`, and OpenRouter. See [Use classifier models](docs/models.md#use-classifier-models) and [Codemode](docs/codemode.md#models).
+- **Models Configuration reference**: every provider, model, model override, and compatibility field of `models.json`, generated from its schema. See [Models Configuration](docs/models-configuration.md).
+- **Summaries without a fixed output cap**: compaction and branch summaries use the model's output limit, so long reasoning no longer makes them fail. See [Compaction](docs/compaction.md#compaction).
+- **Codemode waits for a free worker**: parallel scripts and in-process subagents queue instead of failing, and `PI_CODEMODE_MAX_WORKERS` raises the limit. See [Codemode limits](docs/codemode.md#limits).
+- **Rex terminal support**: OSC 8 hyperlinks, truecolor, and inline images.
+
+### Added
+
+- Added a Models Configuration reference generated from the `models.json` schema, listing all provider, model, model override, and compatibility fields ([#10790](https://github.com/earendil-works/pi/issues/10790))
+- Codemode `models.classify()` now accepts `images` for TypeSafe's Jev and Cloudflare's Clef models on `typesafe`, `cloudflare-workers-ai`, and OpenRouter, and lists Clef Omni and Jev 1.14 on Workers AI.
+- Provider-level `compat` in `models.json` now also applies to classifier models, with the System One fields `imageInput` and `sendImageOptInHeader` for proxies that serve another service's classifiers. Extension classifier models accept `compat` too.
+- Added `MiniMax-M3.1-Flash` to the `minimax` and `minimax-cn` providers, with thinking levels low through max ([#11121](https://github.com/earendil-works/pi/issues/11121))
+- Added support for the Rex terminal: OSC 8 hyperlinks, truecolor, and inline images ([#11131](https://github.com/earendil-works/pi/issues/11131), [#11150](https://github.com/earendil-works/pi/pull/11150) by [@petrroll](https://github.com/petrroll), [#11183](https://github.com/earendil-works/pi/pull/11183) by [@nihaals](https://github.com/nihaals))
+
+### Changed
+
+- Provider attribution headers now come from pi-ai's client identity. Extensions' `before_provider_headers` handlers no longer see the OpenRouter, NVIDIA NIM, and OpenCode attribution headers; returning `null` for one still removes it. Cloudflare requests send pi's detailed `User-Agent` instead of `pi-coding-agent`, as do GitHub release checks for tool downloads, and OpenCode requests send `x-opencode-client` whenever attribution is enabled, not only with a session.
 - `generateSummary()` and `generateSummaryWithUsage()` now ignore their `reserveTokens` parameter. Summary requests use the model's output limit instead.
+- Changed the default GitHub Copilot model from `gpt-5.4`, which Copilot retired, to `gpt-6.1-sol`.
+- Changed the default NVIDIA model to `nvidia/nemotron-3.5-super-vl-120b-a12b` ([#10910](https://github.com/earendil-works/pi/pull/10910) by [@cv](https://github.com/cv))
+- Changed the default Xiaomi model to `mimo-v2.6-pro` for the `xiaomi` and Xiaomi Token Plan providers, since `mimo-v2.5-pro` left the catalog.
+- Grok 4.3 and Grok 4.5 on the `xai` provider now offer the `xhigh` thinking level.
+- Sign in with ChatGPT: ChatGPT Business workspace usage-limit errors are not retried and tell the user to ask their workspace admin to increase the limit.
 
 ### Fixed
 
 - Fixed compaction and branch summaries failing with "generation hit the token cap" when reasoning used most of the fixed summary output limit. Summaries now use the model's output limit, and `compaction.reserveTokens` only controls when compaction starts ([#9512](https://github.com/earendil-works/pi/issues/9512), [#9075](https://github.com/earendil-works/pi/issues/9075)).
 - Fixed `models.schema.json` missing descriptions for provider and model fields, so editors showed no hints for them ([#10790](https://github.com/earendil-works/pi/issues/10790))
+- Fixed `pi update` failing with "Managed install marker is missing or invalid" when `managed-install.json` starts with a UTF-8 BOM, which Windows PowerShell 5.1 adds when it rewrites the file.
+- Fixed HTML export showing literal asterisks for Markdown bold and italic next to CJK punctuation ([#3353](https://github.com/earendil-works/pi/issues/3353), [#10154](https://github.com/earendil-works/pi/issues/10154))
+- Fixed the terminal staying in mouse-tracking, focus-reporting, Kitty keyboard, and alternate-screen modes when pi exits without its normal terminal teardown, which flooded the shell prompt with escape sequences ([#11170](https://github.com/earendil-works/pi/issues/11170))
+- Fixed concurrent extension `select`/`confirm`/`input`/`editor` dialogs and inline `custom()` components in interactive mode: a second dialog replaced the first and the first promise never settled; closing the visible dialog now shows the previous one again ([#11166](https://github.com/earendil-works/pi/issues/11166), [#9909](https://github.com/earendil-works/pi/issues/9909))
+- Fixed pasting in the shell hanging after copying text in pi and suspending it with Ctrl+Z on Linux: the background `wl-copy`/`xclip`/`xsel` process that keeps serving the clipboard was suspended along with pi ([#11179](https://github.com/earendil-works/pi/issues/11179))
+- Fixed codemode scripts failing immediately when both codemode workers are busy, for example with parallel codemode calls or in-process subagents. Scripts now wait up to 60 seconds for a free worker, and `PI_CODEMODE_MAX_WORKERS` raises the limit of two workers ([#11184](https://github.com/earendil-works/pi/issues/11184))
+- Fixed extensions failing to load when importing `@earendil-works/pi-ai/models` (e.g. for `clampThinkingLevel`) by exposing the subpath through the extension loader aliases and virtual modules ([#11156](https://github.com/earendil-works/pi/issues/11156))
+- Fixed `mcp.json` files that start with a UTF-8 BOM failing to parse, which skipped all their MCP servers and made `pi mcp add`/`pi mcp remove` fail ([#11191](https://github.com/earendil-works/pi/issues/11191))
+- Fixed `/compact <instructions>` ignoring the instructions when summarizing the start of a turn that compaction splits. When the split turn was the only new content since the last compaction, the instructions were ignored entirely ([#11058](https://github.com/earendil-works/pi/issues/11058))
+- Fixed resumed sessions and `/tree` navigation leaving extension tools inactive when the branch recorded its tools before they were registered, such as tools from extensions installed after the session started. Extension tools the branch never added or removed are now active unless they are registered with `defaultActive: false` ([#11062](https://github.com/earendil-works/pi/issues/11062), [#11075](https://github.com/earendil-works/pi/issues/11075))
+- Fixed sessions breaking after recovery from a response cut off at the output limit: the truncated tool call was omitted but its tool results were kept, so providers rejected every later request ([#11227](https://github.com/earendil-works/pi/issues/11227), [#11233](https://github.com/earendil-works/pi/pull/11233) by [@petrroll](https://github.com/petrroll))
+- Fixed the `grep` tool following `RIPGREP_CONFIG_PATH`, where options such as `--fixed-strings` silently changed regex searches into literal ones. The tool now runs `rg --no-config` ([#11203](https://github.com/earendil-works/pi/issues/11203), [#11230](https://github.com/earendil-works/pi/pull/11230) by [@petrroll](https://github.com/petrroll))
+- Fixed Windows shell detection rejecting runnable Microsoft Store shell aliases ([#9504](https://github.com/earendil-works/pi/pull/9504) by [@petrroll](https://github.com/petrroll))
+- Fixed Windows shell detection missing PowerShell outside `PATH` and the legacy WSL `bash.exe` launcher when Windows is not installed in `C:\Windows`. pi now checks `%ProgramFiles%\PowerShell\7`, `%SystemRoot%\System32\WindowsPowerShell\v1.0`, and `%SystemRoot%` ([#9501](https://github.com/earendil-works/pi/pull/9501) by [@petrroll](https://github.com/petrroll))
+- Fixed GitHub Copilot sessions with large request bodies, such as many images, failing with HTTP 413 `failed to parse request` instead of compacting and retrying ([#11016](https://github.com/earendil-works/pi/pull/11016) by [@petrroll](https://github.com/petrroll))
+- Fixed the `openai-codex` provider offering `gpt-5.5` and `gpt-5.3-codex-spark`, which always fail for ChatGPT accounts ([#11173](https://github.com/earendil-works/pi/pull/11173) by [@lucasmeijer](https://github.com/lucasmeijer))
+- Fixed whitespace-only tool output (for example a bare `\r\n` from bash) making OpenAI Completions, OpenAI Responses, and Google requests fail with a 400 ([#8720](https://github.com/earendil-works/pi/issues/8720))
+- Fixed automatic retry not triggering for more gateway upstream failures, `stream disconnected before completion` errors relayed by Codex CLI proxies, and transient Google Vertex OAuth token refresh failures, and retrying errors because of digits inside request ids or byte counts ([#10920](https://github.com/earendil-works/pi/issues/10920), [#11057](https://github.com/earendil-works/pi/issues/11057), [#10996](https://github.com/earendil-works/pi/issues/10996))
+- Fixed OpenAI Responses models losing the prompt cache on every deferred tool load after a tool was removed ([#10940](https://github.com/earendil-works/pi/issues/10940))
+- Fixed Cloudflare Workers AI classifier pricing: Clef Flash costs $0.038 and Jev $0.042 per million input tokens instead of Jev being listed as free.
+- Fixed an unclosed `$$` display-math block swallowing or corrupting every Markdown table after it ([#11159](https://github.com/earendil-works/pi/issues/11159))
+- Fixed Markdown bold and italic not rendering next to CJK punctuation ([#10730](https://github.com/earendil-works/pi/pull/10730) by [@theBucky](https://github.com/theBucky))
+- Fixed `@` file autocomplete returning no results for queries containing regex metacharacters such as `[` or `(` ([#10972](https://github.com/earendil-works/pi/issues/10972))
 
 ## [1.3.0] - 2026-10-15
 
@@ -34,10 +101,6 @@
 
 - Changed the `kimi-coding` provider to use OpenAI Chat Completions at `https://api.kimi.com/coding/v1`, the protocol used by the official Kimi Code client. K3, K3-256K, and Kimi For Coding now accept tools added mid-conversation without invalidating the prompt cache. `models.json` overrides of the `kimi-coding` base URL must now include `/v1` ([#10720](https://github.com/earendil-works/pi/issues/10720))
 - Changed model switching to drop thinking blocks from earlier assistant messages produced by a different model, instead of sending them as plain text. The new model previously saw the old model's reasoning as part of its replies and could start writing its own reasoning into the visible answer ([#10995](https://github.com/earendil-works/pi/issues/10995))
-
-### Changed
-
-- Changed the default NVIDIA model to `nvidia/nemotron-3.5-super-vl-120b-a12b` ([#10910](https://github.com/earendil-works/pi/pull/10910) by [@cv](https://github.com/cv))
 
 ### Fixed
 

@@ -7,16 +7,8 @@ import {
 	type TelemetrySpan,
 } from "@earendil-works/pi-telemetry";
 import { ConversationBusy } from "../errors.ts";
-import type { SessionImpl } from "../session/session.ts";
-import type {
-	CommitPublication,
-	ConversationId,
-	JsonObject,
-	Storage,
-	SubmissionId,
-	SubmissionRecord,
-	Tx,
-} from "../types.ts";
+import type { ObservedCommit, SessionImpl } from "../session/session.ts";
+import type { ConversationId, JsonObject, Storage, SubmissionId, SubmissionRecord, Tx } from "../types.ts";
 import { startRun } from "./generation.ts";
 import {
 	appendInput,
@@ -65,7 +57,7 @@ export class Submissions {
 		this.#now = now;
 		this.#queueModes = queueModes;
 		this.#resume = resume;
-		session.observeCommits((publication) => this.#observe(publication));
+		session.followCommits((publication) => this.#observe(publication));
 		session.subscribeClose(() => {
 			this.#closed = true;
 			this.#waiters.rejectAll(closedError(this.#session));
@@ -75,7 +67,9 @@ export class Submissions {
 	/** Admit a submission in one commit; see `admitSubmission()`. */
 	async submit(conversationId: ConversationId, draft: SubmissionDraft, context: Context): Promise<Submission> {
 		this.#resume();
-		const parent = draft.type === "input" ? this.#telemetry : context.telemetry;
+		// Inputs and continues start runs: root traces linked to their callers.
+		const startsRun = draft.type !== "write";
+		const parent = startsRun ? this.#telemetry : context.telemetry;
 		return createTypedSpanStarter(parent, [DURABLE_TELEMETRY_SCHEMA])(
 			"pi.durable.submit",
 			{
@@ -83,7 +77,7 @@ export class Submissions {
 				"conversation.id": conversationId,
 			},
 			async (span) => {
-				if (draft.type === "input") span.addLink({ context: context.telemetry });
+				if (startsRun) span.addLink({ context: context.telemetry });
 				try {
 					const { id, status } = await this.#session.commitWith(
 						(tx) => admitSubmission(tx, conversationId, draft, this.#now(), this.#queueModes(), span),
@@ -142,7 +136,9 @@ export class Submissions {
 		}, context);
 	}
 
-	#observe(publication: CommitPublication): void {
+	#observe(publication: ObservedCommit): void {
+		// A commit held in memory changes documents only.
+		if (publication.kind === "memory") return;
 		for (const change of publication.changes) {
 			if (change.type !== "submission" || !isSettled(change.value)) continue;
 			this.#waiters.resolve(change.value.id, change.value);
@@ -193,7 +189,8 @@ function checkInputEntry(entry: InputEntry): void {
  * known request ID returns its existing submission without writing. A display-only write (only `kind` and `data`) is
  * appended and settled `done` at once, busy or not, as it changes nothing the model sees; only behind a queued reset it
  * queues, so it lands after the reset instead of before it in the context the reset ends. A busy conversation queues anything else in
- * `pi.inbox`, or rejects `whenBusy: "reject"` input with `ConversationBusy`. An idle conversation with queued items
+ * `pi.inbox`, or rejects `whenBusy: "reject"` input and any continue with `ConversationBusy`. An idle continue places
+ * queued items and starts a run with them and itself, placing no entry of its own. An idle conversation with queued items
  * queues it behind them and runs a final boundary. Otherwise idle input places its entry (`pi.user`, or the input's
  * own) and starts a run, and an idle write appends its entry and settles `done`, or `stale` when its head reaches
  * before the active range.
@@ -238,6 +235,16 @@ export async function admitSubmission(
 		if (run?.trace !== undefined) span.addLink({ context: span.propagation.extract(run.trace) });
 	}
 	if (busy && draft.type === "input" && draft.whenBusy === "reject") throw new ConversationBusy(conversationId);
+	if (draft.type === "continue") {
+		// Never queued: whether a run can continue depends on how the current one ends. Rejected before any write.
+		if (busy) throw new ConversationBusy(conversationId);
+		const boundary = await prepareBoundary(tx, conversationId, queueModes);
+		const { id } = await tx.createSubmission({ ...fields, type: "continue", status: "placed" });
+		// Items an earlier failed run left queued (`afterFailedRun: "keep"`) are placed first and join the run.
+		const { users } = await applyBoundary(tx, boundary, "final", now);
+		await startRun(tx, conversationId, live, [...users, id]);
+		return { id, status: "placed" };
+	}
 	// A boundary reads the table, so it is prepared before the first table write; a busy one needs none.
 	const boundary = busy ? undefined : await prepareBoundary(tx, conversationId, queueModes);
 	if (boundary === undefined || boundary.inbox.items.length > 0) {

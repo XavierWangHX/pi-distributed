@@ -35,14 +35,15 @@
  * call with an error result.
  */
 import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
+import { ownedSlice } from "@earendil-works/chord/delta";
 import type { TextContent } from "@earendil-works/pi-ai";
-import {
-	type CodemodeHostCall,
-	type CodemodeOutcome,
-	type CodemodeResult,
-	type CodemodeRun,
-	type CodemodeSandboxBase,
-	toCodemodeIdentifier,
+import { toCodemodeIdentifier } from "@earendil-works/pi-codemode/declarations";
+import type {
+	CodemodeHostCall,
+	CodemodeOutcome,
+	CodemodeResult,
+	CodemodeRun,
+	CodemodeSandboxBase,
 } from "@earendil-works/pi-codemode/portable";
 import { CODEMODE_SOURCE_GRAMMAR, parseCodemodeSource } from "@earendil-works/pi-codemode/source";
 import { type Static, Type } from "typebox";
@@ -198,7 +199,8 @@ const ARGS_PREVIEW_CHARS = 200;
 const ERROR_PREVIEW_CHARS = 500;
 
 function cut(text: string, max: number): string {
-	return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+	// A copy: the row outlives the arguments or error text it previews.
+	return text.length > max ? `${ownedSlice(text, 0, max - 3)}...` : text;
 }
 
 /** A function scripts call as a top-level global; its result is journaled. */

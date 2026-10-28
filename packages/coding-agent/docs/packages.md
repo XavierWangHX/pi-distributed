@@ -16,6 +16,8 @@ pi install ./local-package
 
 `pi list` shows configured packages. Use `pi remove <source>` to remove one and `pi update --extensions` to reconcile package installations. See [Command Line](cli.md#package-commands) for every package command and option.
 
+If a configured package fails to install at startup, for example because npm cannot reach the registry, Pi warns about it, skips that package's resources, and keeps running. Pi tries to install it again on the next start or `/reload`. `pi install` and `pi update --extensions` still report the failure and exit non-zero.
+
 Personal installs are written to `~/.pi/agent/settings.json`. Add `--local` or `-l` to write the package declaration to `.pi/settings.json`. Pi reads declarations from that file only after project trust is granted.
 
 Project packages are installed and loaded only after project trust is resolved. Packages can execute extension code and can include skills that instruct the model to run programs. Review third-party package source before installing it. Review project package declarations before granting project trust.
@@ -72,6 +74,26 @@ Use an explicit manifest when resources live elsewhere or need filtering:
 Paths are relative to the package root. Arrays accept glob patterns and exclusions. List dot-prefixed or symlinked resource roots directly when traversal through a glob would not discover them.
 
 The `pi-package` keyword makes an npm package eligible for discovery in the [Pi package gallery](https://pi.dev/packages). Optional `pi.image` and `pi.video` fields add gallery previews.
+
+## Show a changelog
+
+After a package update, Pi can show what changed. On the next fresh launch, Pi reads the package changelog and shows entries newer than the last seen version under "Extension Updates", the same way it shows its own changelog. The first time Pi sees a package, it records the version without showing anything.
+
+This applies to packages that load at least one extension. Packages that only provide skills, prompt templates, or themes do not show a changelog.
+
+By default Pi reads `CHANGELOG.md` from the package root. Point `pi.changelogPath` at another file inside the package, or set it to `""` to disable the changelog:
+
+```json
+{
+  "name": "my-pi-package",
+  "version": "1.2.0",
+  "pi": {
+    "changelogPath": "./docs/CHANGELOG.md"
+  }
+}
+```
+
+Use version headings in the same format as Pi's changelog, such as `## [1.2.0]` or `## 1.2.0 - 2026-01-01`. Entries are matched against the `version` field in `package.json`, so a git package only shows a changelog when that field increases. The `collapseChangelog` setting condenses the section to one line per package, such as `Updated my-pi-package to v1.2.0.` Unlike Pi's own changelog, `/changelog` does not show package changelogs, so read the package's changelog file or repository for details.
 
 ## Declare dependencies
 
