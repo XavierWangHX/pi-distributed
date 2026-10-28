@@ -55,6 +55,17 @@ export class PgDatabase {
 		});
 	}
 
+	async runCounted(sql: string, ...params: PgValue[]): Promise<number> {
+		return await this.#schedule(async () => {
+			const result = await this.#client
+				.query(placeholders(sql), params)
+				.catch((error: Error & { routine?: string }) => {
+					throw new Error(`${error.message} [sql: ${sql}] [params: ${params.map((p) => typeof p).join(", ")}]`);
+				});
+			return result.rowCount ?? 0;
+		});
+	}
+
 	async get<T extends object>(sql: string, ...params: PgValue[]): Promise<T | undefined> {
 		return this.#schedule(async () => {
 			const result = await this.#client.query<T>(placeholders(sql), params).catch((error: unknown) => {
@@ -84,6 +95,12 @@ export class PgDatabase {
 					await this.#client.query(placeholders(sql), params).catch((error: unknown) => {
 						throw tagQuery(error, sql, params);
 					});
+				},
+				runCounted: async (sql, ...params) => {
+					const result = await this.#client.query(placeholders(sql), params).catch((error: unknown) => {
+						throw tagQuery(error, sql, params);
+					});
+					return result.rowCount ?? 0;
 				},
 				get: async <T extends object>(sql: string, ...params: PgValue[]) => {
 					const result = await this.#client.query<T>(placeholders(sql), params).catch((error: unknown) => {
@@ -126,6 +143,7 @@ export class PgDatabase {
 export interface PgExecutor {
 	exec(sql: string): Promise<void>;
 	run(sql: string, ...params: PgValue[]): Promise<void>;
+	runCounted(sql: string, ...params: PgValue[]): Promise<number>;
 	get<T extends object>(sql: string, ...params: PgValue[]): Promise<T | undefined>;
 	all<T extends object>(sql: string, ...params: PgValue[]): Promise<T[]>;
 }

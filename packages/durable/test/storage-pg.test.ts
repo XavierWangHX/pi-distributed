@@ -41,10 +41,14 @@ class ReopeningStorage implements Storage {
 		this.schema = schema;
 	}
 
-	async commit(writes: readonly StorageWrite[], commitContext: Parameters<Storage["commit"]>[1]): Promise<Seq> {
-		if (this.closed) return this.current.commit(writes, commitContext);
+	async commit(
+		writes: readonly StorageWrite[],
+		commitContext: Parameters<Storage["commit"]>[1],
+		options: Parameters<Storage["commit"]>[2],
+	): Promise<Seq> {
+		if (this.closed) return this.current.commit(writes, commitContext, options);
 		try {
-			return await this.current.commit(writes, commitContext);
+			return await this.current.commit(writes, commitContext, options);
 		} finally {
 			await this.current.close(context);
 			this.current = await openPgStorage(CONNECTION!, { schema: this.schema });

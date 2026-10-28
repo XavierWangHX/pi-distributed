@@ -429,11 +429,11 @@ export function createSubagent(
 			if (watch !== undefined) {
 				if (watch.value?.entries[name]?.result === undefined) {
 					await new Promise<void>((resolve, reject) => {
-						watch.start(async (value) => {
-							if (value?.entries[name]?.result !== undefined) resolve();
+						watch.start(async (call) => {
+							if (call.kind === "value" && call.value?.entries[name]?.result !== undefined) resolve();
 						});
 						void watch.closed.then(
-							(end) => reject(new Error(`wait for "${name}" ended before an answer: ${end.reason}`)),
+							(end) => reject(new Error(`wait for "${name}" ended before an answer: ${end.kind}`)),
 							() => undefined,
 						);
 					});

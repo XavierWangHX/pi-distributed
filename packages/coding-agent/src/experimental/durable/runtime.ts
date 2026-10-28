@@ -1,4 +1,3 @@
-import type { AttachedReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
 	type AssistantMessage,
@@ -12,6 +11,7 @@ import {
 	type Conversation,
 	type ConversationId,
 	type ConversationView,
+	type ConversationWatch,
 	type Cursor,
 	type EntryId,
 	type EntryRecord,
@@ -21,6 +21,7 @@ import {
 	type Submission,
 	type SubmissionId,
 	type TaskGraph,
+	type TaskGraphWatch,
 } from "@earendil-works/pi-durable";
 import { openPgStorage } from "@earendil-works/pi-durable/storage/pg";
 import { ModelRuntime } from "../../core/model-runtime.ts";
@@ -292,7 +293,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 			cursor = page.next;
 		} while (cursor !== undefined);
 		let current: Conversation = root;
-		let conversation: AttachedReplicatedState<ConversationView> = await root.viewState(context);
+		let conversation: ConversationWatch = await root.watch(context);
 		const models = (): ModelSummary[] =>
 			modelRuntime.getAvailableSnapshot().map((model) => ({
 				provider: model.provider,
@@ -327,29 +328,39 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 		const fail = (error: unknown): void => notice("error", error instanceof Error ? error.message : String(error));
 		report = (error) => notice("warning", error instanceof Error ? error.message : String(error));
 		for (const error of pendingReports) report(error);
-		let unsubscribe = conversation.subscribe((value) => update({ conversation: value }));
+		const followConversation = (watch: ConversationWatch): void => {
+			watch.start(async (call) => {
+				if (call.kind === "value") update({ conversation: call.value });
+			});
+		};
+		followConversation(conversation);
 		// Subagents appear as their conversations are created. A commit listener only records; it calls no Session API.
-		const unsubscribeCommits = harness.subscribeCommits((publication) => {
-			let conversations = state.conversations;
-			for (const change of publication.changes) {
-				if (change.type === "conversation") {
-					conversations = [...conversations, { id: change.value.id, label: label(change.value.id) }];
-				} else if (change.type === "entry" && isInput(change.value)) {
-					const id = change.value.conversationId;
-					conversations = conversations.map((summary) =>
-						summary.id === id && summary.title === undefined ? { ...summary, ...titleOf(change.value) } : summary,
-					);
+		const commitsObservation = harness.observeCommits({
+			advance: (publication) => {
+				let conversations = state.conversations;
+				for (const change of publication.changes) {
+					if (change.type === "conversation") {
+						conversations = [...conversations, { id: change.value.id, label: label(change.value.id) }];
+					} else if (change.type === "entry" && isInput(change.value)) {
+						const id = change.value.conversationId;
+						conversations = conversations.map((summary) =>
+							summary.id === id && summary.title === undefined
+								? { ...summary, ...titleOf(change.value) }
+								: summary,
+						);
+					}
 				}
-			}
-			if (conversations !== state.conversations) update({ conversations });
+				if (conversations !== state.conversations) update({ conversations });
+			},
+			end: () => undefined,
 		});
 
-		let tasks: AttachedReplicatedState<TaskGraph> | undefined;
-		let unsubscribeTasks = (): void => {};
+		let tasks: TaskGraphWatch | undefined;
 		const closeTasks = (): void => {
-			unsubscribeTasks();
-			tasks?.dispose();
-			tasks = undefined;
+			if (tasks !== undefined) {
+				void tasks.stop();
+				tasks = undefined;
+			}
 		};
 
 		let queue = Promise.resolve();
@@ -450,20 +461,21 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 						update({ tasks: undefined });
 						return;
 					}
-					const graph = await opened.taskGraph(context);
+					const graph = await opened.watchTaskGraph(context);
 					tasks = graph;
-					unsubscribeTasks = graph.subscribe((value) => update({ tasks: value }));
+					graph.start(async (call) => {
+						if (call.kind === "value") update({ tasks: call.value });
+					});
 				}),
 			switchConversation: (id) =>
 				command(async () => {
 					const next = await opened.conversation(id, context);
 					if (next === undefined) throw new Error(`Conversation ${id} does not exist`);
-					const nextState = await next.viewState(context);
-					unsubscribe();
-					conversation.dispose();
+					const nextState = await next.watch(context);
+					await conversation.stop();
 					current = next;
 					conversation = nextState;
-					unsubscribe = nextState.subscribe((value) => update({ conversation: value }));
+					followConversation(conversation);
 				}),
 		};
 
@@ -491,9 +503,8 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 			settings: settingsManager,
 			close() {
 				closing ??= (async () => {
-					unsubscribe();
-					unsubscribeCommits();
-					conversation.dispose();
+					commitsObservation.detach();
+					await conversation.stop();
 					closeTasks();
 					try {
 						// Close writes no outcome: a running turn resumes with --continue.

@@ -360,8 +360,8 @@ class DurableTui {
 		} else if (generation?.deferred !== undefined) text = "Waiting for deferred response...";
 		else if (compaction !== undefined) {
 			text = compaction.retry
-				? `Retrying ${compaction.reason} compaction (attempt ${compaction.attempt + 1})...`
-				: `Compacting (${compaction.reason})...`;
+				? `Retrying ${compaction.trigger} compaction (attempt ${compaction.attempt + 1})...`
+				: `Compacting (${compaction.trigger})...`;
 		} else if (runningTool !== undefined) text = `Running ${runningTool.name}... (esc to abort)`;
 		else if (live.run !== undefined) text = "Working... (esc to abort)";
 		if (text === this.#statusText) return;
