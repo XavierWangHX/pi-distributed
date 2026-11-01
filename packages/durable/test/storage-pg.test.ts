@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { idFromNumber } from "../src/ids.ts";
 import { openPgStorage } from "../src/storage/pg/index.ts";
 import type { SqliteStorage } from "../src/storage/sqlite/index.ts";
-import type { ConversationId, EntryId, Id, Seq, Storage, StorageWrite } from "../src/types.ts";
+import type { CommitResult, ConversationId, EntryId, Id, Seq, Storage, StorageWrite } from "../src/types.ts";
 
 // Run with PG_STORAGE_URL set, for example:
 //   PG_STORAGE_URL=postgres://pi:pi@localhost:5433/durable npx vitest --run test/storage-pg.test.ts
@@ -42,13 +42,13 @@ class ReopeningStorage implements Storage {
 	}
 
 	async commit(
-		writes: readonly StorageWrite[],
-		commitContext: Parameters<Storage["commit"]>[1],
-		options: Parameters<Storage["commit"]>[2],
-	): Promise<Seq> {
-		if (this.closed) return this.current.commit(writes, commitContext, options);
+		batches: readonly (readonly StorageWrite[])[],
+		receive: (index: number, seq: Seq) => void,
+		commitContext: Context,
+	): Promise<CommitResult> {
+		if (this.closed) return this.current.commit(batches, receive, commitContext);
 		try {
-			return await this.current.commit(writes, commitContext, options);
+			return await this.current.commit(batches, receive, commitContext);
 		} finally {
 			await this.current.close(context);
 			this.current = await openPgStorage(CONNECTION!, { schema: this.schema });
