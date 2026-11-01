@@ -89,7 +89,40 @@ interface LocalEditor<V extends Variants, C extends Change> extends MethodEditor
 		args: A,
 		result: R,
 	): LocalEditor<Put<V, Local, "methods", M, Method<A, R>>, C | [Local, M, "args" | "result"]>;
+	/** Changes keyed member `member`'s schema (slice 7b: an older consumer reads each key mapped, or is refused). */
+	keyed<M extends KeyedNames<V> & string, S extends TSchema>(
+		member: M,
+		schema: S,
+	): LocalEditor<PutKeyed<V, M, S>, C | [Local, M, "keyed"]>;
+	addKeyed<const M extends string, S extends TSchema>(
+		member: M,
+		schema: S,
+	): LocalEditor<PutKeyed<V, M, S>, C | [Local, M, "keyed"]>;
+	removeKeyed<M extends KeyedNames<V> & string>(member: M): LocalEditor<DropKeyed<V, M>, C>;
 }
+
+/** The local variant's keyed member names. */
+type KeyedNames<V extends Variants> = keyof NonNullable<V[Local]["keyed"]>;
+
+/** The local variant with keyed member `M` set to `T`. */
+type PutKeyed<V extends Variants, M extends string, T> = {
+	[Y in keyof V]: Y extends Local
+		? {
+				[S in keyof V[Y] | "keyed"]: S extends "keyed"
+					? {
+							[K in keyof NonNullable<V[Y]["keyed"]> | M]: K extends M ? T : NonNullable<V[Y]["keyed"]>[K];
+						}
+					: V[Y][S & keyof V[Y]];
+			}
+		: V[Y];
+};
+
+/** The local variant without keyed member `M`. */
+type DropKeyed<V extends Variants, M extends string> = {
+	[Y in keyof V]: Y extends Local
+		? { [S in keyof V[Y]]: S extends "keyed" ? Omit<NonNullable<V[Y]["keyed"]>, M> : V[Y][S] }
+		: V[Y];
+};
 
 type Local = typeof LOCAL;
 
@@ -113,7 +146,7 @@ type Drop<V extends Variants, X, Side extends EditedSide, M extends string> = {
 	[Y in keyof V]: Y extends X ? { [S in keyof V[Y]]: S extends Side ? Omit<V[Y][S], M> : V[Y][S] } : V[Y];
 };
 
-/** The sides of a variant that edits change; keyed members are carried over unchanged (their versions: slice 7). */
+/** The sides of a variant that `Put` and `Drop` edit (keyed members have their own, `PutKeyed` and `DropKeyed`). */
 type EditedSide = "state" | "methods";
 
 type Evolved<S extends ContractShape, E extends MethodEditor<S["kind"], Variants, Change>> = {
@@ -153,11 +186,11 @@ export function editWith<E>(editor: E, edit: (editor: E) => unknown, what: strin
 	if (edit(editor) !== editor) throw new Error(`${what} must return the editor it was given`);
 }
 
-/** A variant under construction; keyed members are carried over unchanged (their versions are slice 7's). */
+/** A variant under construction. */
 type DraftVariant = {
 	readonly state: Map<string, Snapshot>;
 	readonly methods: Map<string, MethodData>;
-	readonly keyed: ReadonlyMap<string, Snapshot>;
+	readonly keyed: Map<string, Snapshot>;
 };
 
 /** The next version under construction, and the remote editor. Every edit is checked as it is made. */
@@ -181,7 +214,7 @@ class Draft {
 		this.#variants = new Map(
 			[...current.variants].map(([name, { state, methods, keyed }]) => [
 				name,
-				{ state: new Map(state), methods: new Map(methods), keyed },
+				{ state: new Map(state), methods: new Map(methods), keyed: new Map(keyed) },
 			]),
 		);
 		this.#kinds = new Map(data.kinds);
@@ -228,6 +261,25 @@ class Draft {
 		return this.#checked();
 	}
 
+	keyed(variant: string, member: string, schema: TSchema): object {
+		if (!this.#variant(variant).keyed.has(member)) {
+			throw new Error(`${this.#path(variant, member, "keyed")}: no such keyed member`);
+		}
+		return this.#putKeyed(variant, member, schema);
+	}
+
+	addKeyed(variant: string, member: string, schema: TSchema): object {
+		this.#refuseDeclared(variant, member, "keyed");
+		return this.#putKeyed(variant, member, schema);
+	}
+
+	removeKeyed(variant: string, member: string): object {
+		if (!this.#variant(variant).keyed.delete(member)) {
+			throw new Error(`${this.#path(variant, member, "keyed")}: no such keyed member`);
+		}
+		return this.editor;
+	}
+
 	removeMethod(member: string): object {
 		for (const variant of this.#variantsWith(member)) this.#variant(variant).methods.delete(member);
 		return this.editor;
@@ -243,6 +295,12 @@ class Draft {
 	#putState(variant: string, member: string, schema: TSchema): object {
 		this.#variant(variant).state.set(member, snapshotSchema(schema, this.#path(variant, member, "state")));
 		this.#changes.push([variant, member, "state"]);
+		return this.#checked();
+	}
+
+	#putKeyed(variant: string, member: string, schema: TSchema): object {
+		this.#variant(variant).keyed.set(member, snapshotSchema(schema, this.#path(variant, member, "keyed")));
+		this.#changes.push([variant, member, "keyed"]);
 		return this.#checked();
 	}
 
@@ -277,8 +335,8 @@ class Draft {
 	}
 
 	#refuseDeclared(variant: string, member: string, kind: MemberKind): void {
-		const { state, methods } = this.#variant(variant);
-		if (state.has(member) || methods.has(member)) {
+		const { state, methods, keyed } = this.#variant(variant);
+		if (state.has(member) || methods.has(member) || keyed.has(member)) {
 			throw new Error(`${this.#path(variant, member, kind)}: already declared`);
 		}
 	}
@@ -305,6 +363,9 @@ function localEditor(draft: Draft): object {
 		result: (member: string, result: TSchema) => draft.result(member, result),
 		method: (member: string, args: TSchema, result: TSchema) => draft.method(member, args, result),
 		removeMethod: (member: string) => draft.removeMethod(member),
+		keyed: (member: string, schema: TSchema) => draft.keyed(LOCAL, member, schema),
+		addKeyed: (member: string, schema: TSchema) => draft.addKeyed(LOCAL, member, schema),
+		removeKeyed: (member: string) => draft.removeKeyed(LOCAL, member),
 	};
 	return draft.editor;
 }

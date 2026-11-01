@@ -6,11 +6,12 @@
 import type { Context } from "../../context/index.ts";
 import { type Prepared, type Tracker, track } from "../../delta/index.ts";
 import { ChordError } from "../data/index.ts";
+import type { StagedWrite } from "../store/step.ts";
 import { AddressSource } from "./address-source.ts";
-import type { JsonObject, StateDefinition } from "./definition.ts";
+import type { CommitPersistence, JsonObject, StateDefinition } from "./definition.ts";
 import type { Documents } from "./documents.ts";
 import type { SealToken } from "./fence.ts";
-import type { Persistence, Stored } from "./persistence.ts";
+import { type DocumentChange, type Persistence, type Stored, type StoredChange, storedAfter } from "./persistence.ts";
 
 /** A document definition, whatever its value and keyedness. */
 export type AnyDefinition = StateDefinition<JsonObject, boolean, boolean>;
@@ -27,8 +28,13 @@ export interface DocumentSlot {
 	initial(context: Context): JsonObject;
 	/** The persisted slot's store side; `undefined` for documents in memory only. */
 	readonly persisted: PersistedSlot | undefined;
-	/** Adopts a commit of the document at `key` (inside the batch), with what is stored of it after the commit. */
-	adopt(key: string, tracker: Tracker<JsonObject>, prepared: Prepared<JsonObject>, stored: Stored | undefined): void;
+	/** Adopts a commit of the document at `key` (inside the batch), with what the commit stored of it. */
+	adopt(
+		key: string,
+		tracker: Tracker<JsonObject>,
+		prepared: Prepared<JsonObject>,
+		stored: StoredChange | undefined,
+	): void;
 	/** Retires the document at `key` (inside the batch). */
 	retire(key: string): void;
 }
@@ -41,6 +47,17 @@ export interface PersistedSlot {
 	cold(key: string): boolean;
 	/** What is stored of the document at `key` as memory knows it; `undefined` when absent or cold. */
 	stored(key: string): Stored | undefined;
+	/**
+	 * Stages one commit's writes of the document at `key` into `writes` (`was`: what is stored of it, a cold one's as
+	 * the transaction found it); `persistence` is the transaction's (a deferred change of a run's state is held, D8).
+	 */
+	stage(
+		key: string,
+		change: DocumentChange,
+		was: Stored | undefined,
+		writes: StagedWrite[],
+		persistence: CommitPersistence,
+	): StoredChange;
 	/**
 	 * Loads the document at `key` (its caller holds the line): installed when present and still absent from memory,
 	 * and, for a transaction's load (`token`), while the token is not sealed (a cut transaction released the line, so
@@ -205,6 +222,10 @@ export class SingletonSlot extends AddressSource implements DocumentSlot, Persis
 		return this.#stored;
 	}
 
+	stage(key: string, change: DocumentChange, was: Stored | undefined, writes: StagedWrite[]): StoredChange {
+		return this.persistence.stage(key, this.definition.current, was, change, writes);
+	}
+
 	current(_key: string): Tracker<JsonObject> | undefined {
 		return this.#tracker;
 	}
@@ -214,12 +235,17 @@ export class SingletonSlot extends AddressSource implements DocumentSlot, Persis
 		return this.#initial!;
 	}
 
-	adopt(_key: string, tracker: Tracker<JsonObject>, prepared: Prepared<JsonObject>, stored: Stored | undefined): void {
+	adopt(
+		_key: string,
+		tracker: Tracker<JsonObject>,
+		prepared: Prepared<JsonObject>,
+		stored: StoredChange | undefined,
+	): void {
 		// Unchecked: a step admitted before the object ended adopts after its seal (slice 6a §1.3).
 		const before = this.#tracker?.value ?? this.#initial!;
 		tracker.adopt(prepared);
 		this.#tracker = tracker;
-		this.#stored = stored;
+		this.#stored = stored === undefined ? undefined : storedAfter(stored);
 		this.written(before, prepared);
 	}
 

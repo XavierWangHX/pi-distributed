@@ -2454,7 +2454,7 @@ describe("per-model compaction overrides", () => {
 	});
 });
 
-describe("pi.live version 2", () => {
+describe("pi.live migrations", () => {
 	it("reads a version 1 value with each compaction's `reason` as `trigger`, and stores it migrated on its next write", async () => {
 		const storage = new MemoryStorage();
 		const session = createSession(storage);
@@ -2505,9 +2505,43 @@ describe("pi.live version 2", () => {
 			(await tx.doc(LiveDoc, conversationId)).compactions![0]!.attempt = 3;
 		}, context);
 		expect(await stored()).toMatchObject({
-			version: 2,
+			version: 3,
 			value: { compactions: [{ trigger: "threshold", attempt: 3 }], compactionFailure: { trigger: "manual" } },
 		});
+		await session.close(context);
+	});
+
+	// #11043: an unreleased build stored version 2 without `run.turns`; a run in flight then counted NaN turns.
+	it("gives a version 2 run without turns a count of 0", async () => {
+		const storage = new MemoryStorage();
+		const session = createSession(storage);
+		const LiveV2 = defineDoc<JsonObject>({
+			kind: "pi.live",
+			version: 2,
+			scope: "conversation",
+			history: "latest",
+			fork: "initial",
+			initial: () => ({}),
+			checkpointWhen: () => false,
+		});
+		const conversationId = await session.commit(
+			async (tx) => (await tx.createConversation({ ownership: { kind: "ownerless" } })).id,
+			context,
+		);
+		await session.commit(async (tx) => {
+			const live = await tx.doc(LiveV2, conversationId);
+			live.run = { taskId: 9, inputs: [4] };
+			live.compactions = [{ taskId: 7, trigger: "threshold", blocking: true, attempt: 2 }];
+		}, context);
+		expect(await session.snapshot(LiveDoc, conversationId, context)).toEqual({
+			run: { taskId: 9, inputs: [4], turns: 0 },
+			compactions: [{ taskId: 7, trigger: "threshold", blocking: true, attempt: 2 }],
+		});
+		// A version 2 run that has a count keeps it.
+		await session.commit(async (tx) => {
+			(await tx.doc(LiveV2, conversationId)).run = { taskId: 9, inputs: [4], turns: 3 };
+		}, context);
+		expect((await session.snapshot(LiveDoc, conversationId, context))?.run?.turns).toBe(3);
 		await session.close(context);
 	});
 });

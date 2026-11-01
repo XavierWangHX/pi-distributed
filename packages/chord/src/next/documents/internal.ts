@@ -5,5 +5,13 @@ export { Documents, type DocumentsOwner } from "./documents.ts";
 export { SealToken } from "./fence.ts";
 export { type KeyDeclarer, Keyed, Singleton } from "./handles.ts";
 export { type KeyedSlot, KeySource } from "./keyed-slot.ts";
-export type { AnyDefinition, DocumentSlot } from "./slot.ts";
+export {
+	type DocumentChange,
+	type Held,
+	Persistence,
+	type Stored,
+	type StoredChange,
+	storedAfter,
+} from "./persistence.ts";
+export { type AnyDefinition, type DocumentSlot, type PersistedSlot, SlotDefinition } from "./slot.ts";
 export type { Staged, Transaction } from "./transaction.ts";

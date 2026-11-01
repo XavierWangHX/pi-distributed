@@ -119,6 +119,8 @@ describe("generation", () => {
 	it("stores partials as deltas and a complete base once nothing is in flight", async () => {
 		const setup = chatSetup({ tokensPerSecond: 200, tokenSize: { min: 1, max: 1 } });
 		setup.faux.setResponses([fauxAssistantMessage("w".repeat(200))]);
+		// Store deferred partials well within the stream, so some reach Storage before the answer.
+		setup.settings.progress = { persistWithinMs: 100 };
 		const storage = new ControlledStorage();
 		const { harness, root } = await openChat(storage, setup);
 		const record = await storage.findDocument(
@@ -156,7 +158,9 @@ describe("generation", () => {
 		// The earlier settlement stays; the run's own settlement leaves it unchanged.
 		expect(await submission.status(context)).toMatchObject({ status: "unanswered", reason: "withdrawn" });
 		// A run ends without an answer even when its inputs were settled already.
-		expect(await live(harness, root)).toEqual({ runFailure: { taskId, inputs: [submission.id], reason: "aborted" } });
+		expect(await live(harness, root)).toEqual({
+			runFailure: { taskId, inputs: [submission.id], reason: "aborted", first: expect.any(Number) },
+		});
 		await harness.close(context);
 	});
 
@@ -186,6 +190,7 @@ describe("generation", () => {
 				inputs: [expect.any(Number)],
 				reason: "no_model",
 				detail: "Model faux/missing is not available",
+				first: expect.any(Number),
 			},
 		});
 		expect((await live(harness, plain))?.runFailure).toMatchObject({
@@ -315,7 +320,9 @@ describe("generation", () => {
 		const converted = entries[1]!.model![0] as AssistantMessage;
 		expect(converted.stopReason).toBe("aborted");
 		expect(textOf(converted)!.startsWith(textOf(partial as Message)!)).toBe(true);
-		expect(await live(harness, root)).toEqual({ runFailure: { taskId, inputs: [submission.id], reason: "aborted" } });
+		expect(await live(harness, root)).toEqual({
+			runFailure: { taskId, inputs: [submission.id], reason: "aborted", first: expect.any(Number) },
+		});
 		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
 		await harness.close(context);
 	});
@@ -332,7 +339,9 @@ describe("generation", () => {
 		await harness.abortTask(taskId, context);
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
 		expect(setup.faux.state.cancelledDeferred).toHaveLength(1);
-		expect(await live(harness, root)).toEqual({ runFailure: { taskId, inputs: [submission.id], reason: "aborted" } });
+		expect(await live(harness, root)).toEqual({
+			runFailure: { taskId, inputs: [submission.id], reason: "aborted", first: expect.any(Number) },
+		});
 		await harness.close(context);
 	});
 
@@ -356,7 +365,9 @@ describe("generation", () => {
 		await harness.abortTask(taskId, context);
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
 		expect(setup.reports).toContainEqual(new Error("cancel failed"));
-		expect(await live(harness, root)).toEqual({ runFailure: { taskId, inputs: [submission.id], reason: "aborted" } });
+		expect(await live(harness, root)).toEqual({
+			runFailure: { taskId, inputs: [submission.id], reason: "aborted", first: expect.any(Number) },
+		});
 		await harness.close(context);
 	});
 
@@ -691,6 +702,7 @@ describe("generation", () => {
 				inputs: [submission.id],
 				reason: "faulted",
 				detail: expect.stringContaining("non-JSON function"),
+				first: expect.any(Number),
 			},
 		});
 		const tasks = await harness.commit((tx) => tx.scanTasks({ conversationId: root.id }, 10), context);

@@ -19,13 +19,14 @@ export function quote(name: string): string {
 	return `"${name}"`;
 }
 
-/** The SQL name of an object's table: `<host kind>:<object type>:<table>`, injective since no part contains `:`. */
-export function tableSqlName(hostKind: string, objectType: string, table: string): string {
-	return `${hostKind}:${objectType}:${table}`;
+/** The SQL name of an owner's table: `<owner>:<table>` (R2), injective since neither part contains `:`. */
+export function tableSqlName(owner: string, table: string): string {
+	return `${owner}:${table}`;
 }
 
 /**
- * `CREATE TABLE` for `columns` (as recorded) and `key`: `STRICT`, `WITHOUT ROWID`, the key as primary key, an `int`
+ * `CREATE TABLE` for `columns` (as recorded) and `key`: `STRICT`, the key as primary key (`WITHOUT ROWID`, except
+ * for a single `int` key, which becomes the rowid: the fastest point lookups, and rows of any size), an `int`
  * column checked within ±(2^53 - 1) (rule 10), a `bool` one within 0 and 1, a `json(...)` one as `TEXT` with its
  * version column, and the row's `$v`.
  */
@@ -37,7 +38,8 @@ export function createTableSql(
 	const definitions = Object.entries(columns).flatMap(([name, column]) => columnSql(name, column));
 	definitions.push(`${quote(ROW_VERSION)} INTEGER NOT NULL`);
 	definitions.push(`PRIMARY KEY (${key.map(quote).join(", ")})`);
-	return `CREATE TABLE ${quote(table)} (${definitions.join(", ")}) STRICT, WITHOUT ROWID`;
+	const rowid = key.length === 1 && columns[key[0]!]!.type === "int";
+	return `CREATE TABLE ${quote(table)} (${definitions.join(", ")}) STRICT${rowid ? "" : ", WITHOUT ROWID"}`;
 }
 
 const SAFE = Number.MAX_SAFE_INTEGER;
@@ -114,7 +116,12 @@ export class TableSql {
 	readonly get: string;
 	readonly delete: string;
 
-	constructor(table: string, columns: readonly Column[], physical: readonly string[], key: readonly string[]) {
+	constructor(
+		table: string,
+		columns: readonly Pick<Column, "name" | "type">[],
+		physical: readonly string[],
+		key: readonly string[],
+	) {
 		this.table = table;
 		const id = quote(table);
 		this.#select = [
@@ -125,6 +132,11 @@ export class TableSql {
 		this.put = putSql(table, physical);
 		this.get = `SELECT ${this.#select} FROM ${id} WHERE ${this.#byKey}`;
 		this.delete = `DELETE FROM ${id} WHERE ${this.#byKey}`;
+	}
+
+	/** `SELECT` of `columns` of one row by key: a point lookup, without the `ORDER BY` and `LIMIT` of a page. */
+	getColumns(columns: readonly string[]): string {
+		return `SELECT ${columns.map(quote).join(", ")} FROM ${quote(this.table)} WHERE ${this.#byKey}`;
 	}
 
 	/** `UPDATE` of one row by key; `versions` gives each `json(...)` column's version to stamp. */
@@ -151,13 +163,14 @@ export class TableSql {
 
 	/**
 	 * A page: rows matching `where` in `order`, after the order values `after` (row-value comparison; the key in the
-	 * order makes it total), at most `limit` (bound).
+	 * order makes it total), at most `limit` (bound); every column, or only `columns`.
 	 */
 	select(
 		where: WhereNode | undefined,
 		order: Order,
 		after: readonly SqliteValue[] | undefined,
 		limit: number,
+		columns?: readonly string[],
 	): Statement {
 		const params: SqliteValue[] = [];
 		const conditions: string[] = [];
@@ -171,7 +184,8 @@ export class TableSql {
 		const direction = order.direction === "asc" ? "ASC" : "DESC";
 		const sorting = order.columns.map((column) => `${quote(column)} ${direction}`).join(", ");
 		params.push(limit);
-		return { sql: `SELECT ${this.#select} FROM ${quote(this.table)}${filter} ORDER BY ${sorting} LIMIT ?`, params };
+		const select = columns === undefined ? this.#select : columns.map(quote).join(", ");
+		return { sql: `SELECT ${select} FROM ${quote(this.table)}${filter} ORDER BY ${sorting} LIMIT ?`, params };
 	}
 
 	/** `count(*)` of the rows matching `where`. */

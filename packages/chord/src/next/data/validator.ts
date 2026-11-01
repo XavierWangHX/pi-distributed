@@ -34,7 +34,7 @@ const validators = new WeakMap<SchemaOwner, Validator>();
 export function check(
 	validator: Validator,
 	value: unknown,
-	reason: "args" | "params" | "placement",
+	reason: "args" | "params" | "host_address",
 	context: Context,
 ): void {
 	context.telemetry.metrics?.counter("chord.data.validations").add(1);
@@ -48,7 +48,7 @@ export function check(
 function failedCheck(
 	schema: TSchema,
 	value: unknown,
-	reason: "args" | "params" | "placement",
+	reason: "args" | "params" | "host_address",
 	context: Context,
 ): ChordError {
 	context.telemetry.metrics?.counter("chord.data.walks").add(1);

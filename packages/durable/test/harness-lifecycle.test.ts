@@ -20,6 +20,7 @@ import {
 import { describe, expect, it } from "vitest";
 import type { SessionImpl } from "../src/session/session.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { commitWrites } from "../src/testing/commit-writes.ts";
 import { chatSetup, openChat } from "./chat-support.ts";
 import { addHooks, addTask, addTool } from "./harness-support.ts";
 import { ControlledStorage, context, flush } from "./session-support.ts";
@@ -73,12 +74,12 @@ async function seedRunningTask(storage: Storage): Promise<void> {
 	const id = await storage.mintId<TaskId<JsonValue>>();
 	const state = { status: "running", checkpoint: { phase: "run" } } as const;
 	const task = { id, conversationId, kind: "test.seeded", version: 1, input: null, background: false, state };
-	await storage.commit(
+	await commitWrites(
+		storage,
 		[
 			{ type: "conversation", value: { id: conversationId } },
 			{ type: "task", value: { ...task, abortRequested: false } },
 		],
-		() => {},
 		context,
 	);
 }

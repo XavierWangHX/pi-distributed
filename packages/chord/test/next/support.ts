@@ -1,6 +1,7 @@
 // Test support: cost counters through the in-memory telemetry adapter, GC checks, and hosts, links, watches and
 // rejections for the slice tests.
 
+import { DatabaseSync } from "node:sqlite";
 import { setFlagsFromString } from "node:v8";
 import { runInNewContext } from "node:vm";
 import { InMemoryTelemetryContext } from "@earendil-works/pi-telemetry";
@@ -34,9 +35,12 @@ import {
 	createHost,
 	defineFacet,
 	type FacetHost,
+	type FacetSelf,
 	type Host,
 	type HostError,
+	type PluginFailure,
 	type RefState,
+	type RouteHandle,
 	type Self,
 	type StoreSelf,
 } from "../../src/next/host/index.ts";
@@ -65,7 +69,7 @@ import { evolveTable } from "../../src/next/store/table-evolve.ts";
 import { TableHandle, type TableOwner } from "../../src/next/store/table-handle.ts";
 import { prepareTables } from "../../src/next/store/table-migration.ts";
 import { nodeCompression } from "../../src/next-node/compression.ts";
-import { openNodeSqliteDatabase } from "../../src/sqlite/node.ts";
+import { NodeSqliteDatabase, openNodeSqliteDatabase } from "../../src/sqlite/node.ts";
 import type { NativeWatchHandle, WatchCall, WatchHandle } from "../../src/watch.ts";
 
 /** Counts of the `chord.data.*` counters. */
@@ -158,7 +162,7 @@ export function valuesOf<T>(calls: readonly WatchCall<T>[]): (T | { readonly fai
  */
 export function failLive(objects: readonly WeakRef<ChordObject>[], self: Self, error: ChordError): void {
 	// The factory's `self` is its attempt.
-	for (const object of objects) object.deref()?.failLive(self as unknown as Attempt, error);
+	for (const object of objects) object.deref()?.failLive(self as unknown as Attempt, { kind: "broken", error });
 }
 
 /** A local type whose objects' attempts a test ends by hand (`restartable`); it ends with its last reference. */
@@ -230,7 +234,7 @@ async function restartableOf<C extends typeof Restartable | typeof StoreRestarta
 
 /** A host with background errors collected, loaded with one facet (`@test/app`) whose setup is `setup`. */
 export async function loaded(
-	setup: (host: FacetHost) => void,
+	setup: (host: FacetHost, self: FacetSelf) => void,
 	options: {
 		readonly telemetry?: InMemoryTelemetryContext;
 		readonly context?: Context;
@@ -238,18 +242,65 @@ export async function loaded(
 		readonly readyTimeout?: number;
 		readonly store?: Store;
 	} = {},
-): Promise<{ readonly host: Host; readonly errors: HostError[] }> {
+): Promise<{ readonly host: Host; readonly errors: HostError[]; readonly failed: readonly PluginFailure[] }> {
 	const errors: HostError[] = [];
 	const { telemetry, closeTimeout, readyTimeout, store } = options;
 	const host = createHost({ telemetry, closeTimeout, readyTimeout, store, onError: (error) => errors.push(error) });
-	await host.load([{ name: "@test/app", facet: defineFacet(setup) }], options.context ?? BACKGROUND_CONTEXT);
-	return { host, errors };
+	const facets = [{ name: "@test/app", facet: defineFacet(setup) }];
+	const { failed } = await host.load(facets, options.context ?? BACKGROUND_CONTEXT);
+	return { host, errors, failed };
+}
+
+/**
+ * A host with background errors collected, loaded with one facet per plugin, in the order given (`setups` by plugin
+ * name).
+ */
+export async function loadedPlugins(
+	setups: Readonly<Record<string, (host: FacetHost, self: FacetSelf) => void>>,
+	options: { readonly telemetry?: InMemoryTelemetryContext; readonly readyTimeout?: number } = {},
+): Promise<{ readonly host: Host; readonly errors: HostError[]; readonly failed: readonly PluginFailure[] }> {
+	const errors: HostError[] = [];
+	const host = createHost({ ...options, onError: (error) => errors.push(error) });
+	const facets = Object.entries(setups).map(([name, setup]) => ({ name, facet: defineFacet(setup) }));
+	const { failed } = await host.load(facets, BACKGROUND_CONTEXT);
+	return { host, errors, failed };
 }
 
 /** A store on a fresh SQLite `:memory:` database, as Chord's layers see it. */
 export async function memoryStore(options?: { readonly outbox?: boolean }): Promise<ChordStore> {
 	const db = await openNodeSqliteDatabase(":memory:");
 	return (await openStore(sqliteBackend(db), BACKGROUND_CONTEXT, options)) as ChordStore;
+}
+
+/** A statement of the Node facade's transactions a test can make fail. */
+export type TransactionStatement = "BEGIN IMMEDIATE" | "COMMIT" | "ROLLBACK";
+
+/**
+ * A Node SQLite facade on `:memory:` whose next `statement` throws, once per `fail` (the D4 matrix: a failed
+ * `BEGIN`, `COMMIT` or `ROLLBACK`, as the real facade sees one).
+ */
+export function faultyDatabase(): { readonly db: NodeSqliteDatabase; fail(statement: TransactionStatement): void } {
+	const database = new DatabaseSync(":memory:");
+	const failing = new Set<string>();
+	const exec = database.exec.bind(database);
+	database.exec = (sql: string): void => {
+		if (!failing.delete(sql)) {
+			exec(sql);
+			return;
+		}
+		// A failed `ROLLBACK` here still rolls back, so the database stays usable for the rest of the test.
+		if (sql === "ROLLBACK") exec(sql);
+		throw new Error(`injected: ${sql} failed`);
+	};
+	return { db: new NodeSqliteDatabase(database), fail: (statement) => void failing.add(statement) };
+}
+
+/** A store over `faultyDatabase()`, and its `fail`. */
+export async function faultyStore(options?: {
+	readonly outbox?: boolean;
+}): Promise<{ readonly store: ChordStore; fail(statement: TransactionStatement): void }> {
+	const { db, fail } = faultyDatabase();
+	return { store: (await openStore(sqliteBackend(db), BACKGROUND_CONTEXT, options)) as ChordStore, fail };
 }
 
 /**
@@ -267,7 +318,7 @@ export function holdNextCommit(store: ChordStore): { readonly entered: Promise<v
 			apply: async () => {
 				entered.resolve();
 				await gate.promise;
-				return { kind: "dropIndex", table: "x", name: "y" };
+				return [{ kind: "dropIndex", table: "x", name: "y" }];
 			},
 		};
 		return commit([...writes, held], fence, ctx);
@@ -280,13 +331,13 @@ export function tableOwner(failures: ChordError[] = []): TableOwner & { readonly
 	return { label: "app.store", scope: {}, assertLive: () => {}, fail: (error) => void failures.push(error), failures };
 }
 
-/** Creates `definition` (and its indexes) in `store` as `session:app.store:<name>` and returns a handle to it. */
+/** Creates `definition` (and its indexes) in `store` as `app.store:<name>` and returns a handle to it. */
 export async function tableIn(
 	store: ChordStore,
 	definition: TableDefinition,
 	owner = tableOwner(),
 ): Promise<TableHandle> {
-	const table = `session:app.store:${definition.name}`;
+	const table = `app.store:${definition.name}`;
 	const fence = { admit: () => true, adopt: () => {} };
 	await prepareTables([{ definition, table }], store, fence, "app.store", BACKGROUND_CONTEXT);
 	return new TableHandle(definition, table, store, owner);
@@ -353,6 +404,7 @@ export async function linked(
 	const errors = { server: [] as HostError[], client: [] as HostError[] };
 	const { telemetry, readyTimeout } = options;
 	const server = createHost<TestPrincipal>({
+		address: Server(),
 		principal: { kind: "server" },
 		telemetry,
 		readyTimeout,
@@ -499,6 +551,7 @@ export async function rawLinked(
 ): Promise<{ readonly server: Host<TestPrincipal>; readonly peer: RawPeer; readonly errors: HostError[] }> {
 	const errors: HostError[] = [];
 	const server = createHost<TestPrincipal>({
+		address: Server(),
 		principal: { kind: "server" },
 		readyTimeout: options.readyTimeout,
 		compression: options.compression,
@@ -532,8 +585,19 @@ const NOTES_VARIANTS = {
 	reader: { state: { notes: arr(obj({ text: str() })), count: int() }, methods: { wait: method() } },
 };
 
+/** The host kind of the test servers, where every test type but `PlacedNotes` lives. */
+export const Server = hostKind("server");
+
+/** `Server()` as a hold names it on the wire: the address of every test type served on the server. */
+export const SERVER_ADDRESS = { kind: "server", params: {} };
+
 /** The remote type of the link tests: notes per session, an editor variant for owners, a reader one for guests. */
-export const Notes = remote("app.notes", { version: 1, params: { session: str() }, variants: NOTES_VARIANTS });
+export const Notes = remote("app.notes", {
+	version: 1,
+	params: { session: str() },
+	hostAddress: () => Server(),
+	variants: NOTES_VARIANTS,
+});
 
 /** The kind of the relay tests' workers: one per session. */
 export const Session = hostKind("session", { id: str() });
@@ -542,7 +606,7 @@ export const Session = hostKind("session", { id: str() });
 export const PlacedNotes = remote("app.placed-notes", {
 	version: 1,
 	params: { session: str() },
-	placement: ({ session }) => Session({ id: session }),
+	hostAddress: ({ session }) => Session({ id: session }),
 	variants: NOTES_VARIANTS,
 });
 
@@ -582,7 +646,7 @@ export function serveNotes(
 			},
 		};
 	});
-	// The two types differ in their name and placement only.
+	// The two types differ in their name and host address only.
 	host.serve(Type as typeof Notes, ({ session }, principal, self) => {
 		probe.factories.push(`${session} ${principal.kind}`);
 		const store = self.get(NoteStore, { session });
@@ -707,6 +771,8 @@ export type Resolved = {
 export type Relayed = {
 	readonly tab: Host<TestPrincipal>;
 	readonly server: Host<TestPrincipal>;
+	/** The server's route to `Session`'s addresses. */
+	readonly route: RouteHandle<typeof Session>;
 	/** The worker of each resolved session address, the latest one per key. */
 	readonly workers: Map<string, Host<TestPrincipal>>;
 	/** The server's end of each resolved route link, in order. */
@@ -759,6 +825,7 @@ export async function relayed(
 	const resolves: string[] = [];
 	const { revokedBy, compression = {} } = options;
 	const server = createHost<TestPrincipal>({
+		address: Server(),
 		principal: { kind: "server" },
 		revokedBy: options.serverRevokedBy ?? revokedBy,
 		compression: compression.server,
@@ -787,7 +854,7 @@ export async function relayed(
 		return { link: a, principal, trusted: options.trusted, codec };
 	};
 	const resolve = options.resolve ?? (async (_address, made) => made());
-	server.route(
+	const route = server.route(
 		Session,
 		{
 			authorize: options.authorize ?? (() => true),
@@ -806,7 +873,7 @@ export async function relayed(
 	const accepted = { principal: options.tab ?? { kind: "owner" }, codec: tabCodec, limits: options.limits } as const;
 	server.accept(a, accepted, context);
 	tab.connect(b, { principal: { kind: "server" }, codec: tabCodec }, context);
-	return { tab, server, workers, routeLinks, tabLink: a, resolves, errors };
+	return { tab, server, route, workers, routeLinks, tabLink: a, resolves, errors };
 }
 
 /**
@@ -886,8 +953,8 @@ export const ArchiveTables = (() => {
 })();
 
 /**
- * A store holding a bit of everything an archive carries: `client:app.store:edits` at version 2 with 150 rows (two
- * export pages; some written at version 1, `NULL` and `json(...)` cells, an index), `client:app.store:notes` left
+ * A store holding a bit of everything an archive carries: `app.store:edits` at version 2 with 150 rows (two
+ * export pages; some written at version 1, `NULL` and `json(...)` cells, an index), `app.store:notes` left
  * `migrating` at version 2 after one committed chunk, and documents: a singleton, keyed ones with deltas after their
  * base, and a retired one.
  */
@@ -895,8 +962,8 @@ export async function archiveStore(options?: { readonly outbox?: boolean }): Pro
 	const { EditsV1, EditsV2, NotesV1, NotesV2 } = ArchiveTables;
 	const store = await memoryStore(options);
 	const fence = { admit: () => true, adopt: () => {} };
-	const edits = await tableAt(store, "client:app.store:edits", EditsV1);
-	const notes = await tableAt(store, "client:app.store:notes", NotesV1);
+	const edits = await tableAt(store, "app.store:edits", EditsV1);
+	const notes = await tableAt(store, "app.store:notes", NotesV1);
 	const staged: StagedWrite[] = [];
 	const editChanges = new TableChanges(edits, staged);
 	for (let i = 0; i < 150; i++) {
@@ -911,21 +978,15 @@ export async function archiveStore(options?: { readonly outbox?: boolean }): Pro
 	const noteChanges = new TableChanges(notes, staged);
 	for (let i = 0; i < 150; i++) noteChanges.put({ id: i, text: `t${i}` });
 	await store.commit(staged, fence, BACKGROUND_CONTEXT);
+	await prepareTables([{ definition: EditsV2, table: "app.store:edits" }], store, fence, "app", BACKGROUND_CONTEXT);
 	await prepareTables(
-		[{ definition: EditsV2, table: "client:app.store:edits" }],
-		store,
-		fence,
-		"app",
-		BACKGROUND_CONTEXT,
-	);
-	await prepareTables(
-		[{ definition: NotesV2, table: "client:app.store:notes" }],
+		[{ definition: NotesV2, table: "app.store:notes" }],
 		store,
 		fence,
 		"app",
 		BACKGROUND_CONTEXT,
 	).catch(() => {});
-	const address = { namespace: "chord", owner: "client:app.store", kind: "memo" };
+	const address = { namespace: "chord", owner: "app.store", kind: "memo" };
 	const base = (value: JsonValue) => ({ version: 1, fingerprint: "f1", value });
 	let ids: readonly number[] = [];
 	const created = {
@@ -936,7 +997,7 @@ export async function archiveStore(options?: { readonly outbox?: boolean }): Pro
 	};
 	await store.commit(
 		["", "a", "b", "gone"].map((key) =>
-			createDocument({ ...address, key }, "latest", base({ title: key }), JSON.stringify({ title: key })),
+			createDocument({ ...address, key }, base({ title: key }), JSON.stringify({ title: key })),
 		),
 		created,
 		BACKGROUND_CONTEXT,

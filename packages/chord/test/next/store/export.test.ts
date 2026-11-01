@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT as context, withCancel } from "../../../src/context/index.ts";
 import { int, str } from "../../../src/next/contracts/index.ts";
 import { ARCHIVE_FORMAT } from "../../../src/next/store/archive.ts";
+import { insertDocument, insertRevision } from "../../../src/next/store/engine.ts";
 import { EXPORT_PAGE } from "../../../src/next/store/export.ts";
 import { STORE_SCHEMA } from "../../../src/next/store/schema.ts";
 import type { StagedWrite } from "../../../src/next/store/step.ts";
@@ -32,7 +33,7 @@ afterEach(async () => {
 });
 
 describe("parts", () => {
-	it("come in archive order: manifest, per table its table write, puts and indexes, the live documents, end", async () => {
+	it("come in archive order: manifest, per table its table write, puts and indexes, each record and its revisions, end", async () => {
 		store = await archiveStore();
 		const parts = await exported(store);
 		expect(parts[0]).toEqual({
@@ -40,11 +41,11 @@ describe("parts", () => {
 			format: ARCHIVE_FORMAT,
 			schema: STORE_SCHEMA,
 			lastSeq: store.lastSeq,
-			nextDocumentId: store.nextDocumentId,
+			nextId: store.nextId,
 		});
 		const kinds = parts.map((part) =>
 			part.kind === "put" || part.kind === "table" || part.kind === "index"
-				? `${part.kind} ${part.table.split(":")[2]}`
+				? `${part.kind} ${part.table.split(":")[1]}`
 				: part.kind,
 		);
 		const runs: [string, number][] = [];
@@ -60,27 +61,32 @@ describe("parts", () => {
 			["index edits", 1],
 			["table notes", 1],
 			["put notes", 150],
-			["document.create", 3],
+			["document.create", 1],
+			["document.revision", 1],
+			["document.create", 1],
+			["document.revision", 3],
+			["document.create", 1],
+			["document.revision", 2],
 			["end", 1],
 		]);
 		expect(parts.at(-1)).toEqual({ kind: "end", writes: parts.length - 2 });
 	});
 
-	it("are lossless: stored values and versions, NULL cells absent, a migrating table's state, deltas folded into the base", async () => {
+	it("are lossless: stored values and versions, NULL cells absent, a migrating table's state, revisions as stored", async () => {
 		store = await archiveStore();
 		const parts = await exported(store);
 		const edits = parts.filter((part) => part.kind === "put" && part.table.endsWith(":edits"));
 		expect(edits.slice(0, 2)).toEqual([
 			{
 				kind: "put",
-				table: "client:app.store:edits",
+				table: "app.store:edits",
 				row: { id: "e000", path: "p/0", at: 0, note: "n0", meta: { a: 0 }, done: false },
 				version: 1,
 				columns: { meta: 1 },
 			},
 			{
 				kind: "put",
-				table: "client:app.store:edits",
+				table: "app.store:edits",
 				row: { id: "e001", path: "p/1", at: 1, done: false },
 				version: 1,
 				columns: {},
@@ -92,17 +98,64 @@ describe("parts", () => {
 		});
 		const notes = parts.filter((part) => part.kind === "put" && part.table.endsWith(":notes"));
 		expect(notes.map((part) => (part.kind === "put" ? part.version : 0)).filter((v) => v === 2)).toHaveLength(100);
-		const documents = parts.filter((part) => part.kind === "document.create");
-		expect(
-			documents.map((part) =>
-				part.kind === "document.create" ? [part.record.key, part.record.revision, part.base.value] : [],
-			),
-		).toEqual([
+		const documents = parts.flatMap((part): unknown[][] =>
+			part.kind === "document.create"
+				? [[part.record.key, part.record.revision, part.record.history]]
+				: part.kind === "document.revision"
+					? [[part.content.kind, part.content.kind === "base" ? part.content.value : part.content.ops]]
+					: [],
+		);
+		expect(documents).toEqual([
 			// A singleton's record has no key.
-			[undefined, 1, { title: "" }],
-			["a", 3, { title: "a3" }],
-			["b", 2, { title: "b2" }],
+			[undefined, 1, "none"],
+			["base", { title: "" }],
+			["a", 3, "none"],
+			["base", { title: "a" }],
+			["delta", [["s", ["title"], "a2"]]],
+			["delta", [["s", ["title"], "a3"]]],
+			["b", 2, "none"],
+			["base", { title: "b" }],
+			["delta", [["s", ["title"], "b2"]]],
 		]);
+	});
+});
+
+describe("revisions", () => {
+	it("a history longer than a page is read page by page and exported whole, in seq order", async () => {
+		store = await memoryStore();
+		const count = EXPORT_PAGE * 2 + 1;
+		const record = {
+			id: 2,
+			owner: "app.store",
+			namespace: "session",
+			kind: "long",
+			history: "rewindable" as const,
+			createdAt: 1,
+			revision: 1,
+			version: 1,
+			fingerprint: "",
+		};
+		const create: StagedWrite = {
+			order: "write",
+			apply: async (step) => {
+				await insertDocument(step, record, "{}");
+				return [];
+			},
+		};
+		await store.commit([create], OPEN, context);
+		for (let n = 1; n < count; n++) {
+			const ops = JSON.stringify([["s", ["n"], n]]);
+			const delta: StagedWrite = {
+				order: "write",
+				apply: async (step) => {
+					await insertRevision(step, record.id, step.seq, "delta", 1, ops);
+					return [];
+				},
+			};
+			await store.commit([delta], OPEN, context);
+		}
+		const revisions = (await exported(store)).flatMap((part) => (part.kind === "document.revision" ? [part] : []));
+		expect(revisions.map(({ seq }) => seq)).toEqual(Array.from({ length: count }, (_, index) => index + 1));
 	});
 });
 

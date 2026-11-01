@@ -7,6 +7,7 @@ import type { NonEmptyPath, Op, Path } from "../../delta/index.ts";
 import type { JsonValue } from "../../json.ts";
 import { ChordError } from "../data/index.ts";
 import { type Batch, Source } from "../state/internal.ts";
+import type { BlockedReason } from "./run.ts";
 
 /**
  * One entry of `running`: a running or finishing run with its args (and state, when the job has a state document), or
@@ -20,7 +21,7 @@ export type RunningEntry<A, S> =
 			readonly args: A;
 			readonly phase: "running" | "finishing";
 	  } & ([S] extends [undefined] ? unknown : { readonly state: S }))
-	| { readonly id: string; readonly version: number; readonly phase: "blocked"; readonly reason: "finish_failed" };
+	| { readonly id: string; readonly version: number; readonly phase: "blocked"; readonly reason: BlockedReason };
 
 const EMPTY: readonly JsonValue[] = [];
 

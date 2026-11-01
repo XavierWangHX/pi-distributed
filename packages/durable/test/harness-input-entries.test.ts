@@ -377,6 +377,7 @@ describe("data-only writes", () => {
 				inputs: [input.id],
 				reason: "model_error",
 				detail: "invalid request",
+				first: expect.any(Number),
 			},
 		});
 		expect(setup.faux.state.callCount).toBe(1);

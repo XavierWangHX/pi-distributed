@@ -15,7 +15,7 @@ import {
 } from "../../../src/next/contracts/index.ts";
 import { isChordError } from "../../../src/next/data/index.ts";
 import { bindProvider, type CheckedArgs, checkArgs, type Value } from "../../../src/next/data/internal.ts";
-import { counted, expectCollected } from "../support.ts";
+import { counted, expectCollected, Server } from "../support.ts";
 
 const Note = obj({ text: str() });
 const NoteV2 = obj({ text: str(), tag: str() });
@@ -23,6 +23,7 @@ const NoteV2 = obj({ text: str(), tag: str() });
 const NotesV1 = remote("notes", {
 	version: 1,
 	params: { session: str() },
+	hostAddress: () => Server(),
 	variants: {
 		editor: {
 			state: { notes: arr(Note) },

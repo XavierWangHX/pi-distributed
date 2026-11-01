@@ -49,6 +49,7 @@ describe("pi.live.runFailure", () => {
 			inputs: [submission.id],
 			reason: "model_error",
 			detail: "Invalid request",
+			first: expect.any(Number),
 		} satisfies RunFailure);
 		const next = await root.submit({ type: "input", content: "again" }, context);
 		// The commit that starts the next run removes it.
@@ -85,7 +86,12 @@ describe("pi.live.runFailure", () => {
 		const taskId = (await live(harness, root)).run!.taskId;
 		await root.abort(context);
 		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
-		expect((await live(harness, root)).runFailure).toEqual({ taskId, inputs: [submission.id], reason: "aborted" });
+		expect((await live(harness, root)).runFailure).toEqual({
+			taskId,
+			inputs: [submission.id],
+			reason: "aborted",
+			first: expect.any(Number),
+		});
 		await harness.close(context);
 	});
 

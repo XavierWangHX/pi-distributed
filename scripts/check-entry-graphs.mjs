@@ -26,6 +26,7 @@ const WORKSPACE = {
 	"@earendil-works/pi-codemode": "packages/codemode/src",
 	"@earendil-works/pi-telemetry": "packages/telemetry/src",
 	"@earendil-works/pi-mcp": "packages/mcp/src",
+	"@earendil-works/pi-schema": "packages/schema/src",
 	"@earendil-works/pi-tui": "packages/tui/src",
 };
 
@@ -34,6 +35,10 @@ const WORKSPACE = {
  * graph it is allowed to reach.
  */
 const BUDGETS = {
+	"packages/schema": {
+		// The format checks (vendored from TypeBox, about 40 KB) load only through ./formats.
+		".": { maxFiles: 10, forbid: ["schema/src/formats/"] },
+	},
 	"packages/ai": {
 		"./models": {
 			// Request telemetry reaches pi-ai's telemetry.ts and pi-telemetry's root (index, noop, metrics, memory).
@@ -67,8 +72,12 @@ const BUDGETS = {
 			// The Harness's request identity reaches pi-ai's utils/identity.ts and its version constant. Partial commits
 			// parse streamed tool-call arguments with pi-ai's utils/streaming-json.ts (and its json-parse.ts) to append what
 			// argument strings grew by (harness/partial-changes.ts). Chord's watches fold pending ops with Delta's
-			// pending queue (delta/pending.ts).
-			maxFiles: 77,
+			// pending queue (delta/pending.ts). `registryReader` (harness/registry-reader.ts) reads a Chord v2 registry
+			// value through type-only imports. The Session caches hot Storage reads (session/cached-storage.ts) and keeps
+			// each conversation's newest entry and head marker (session/conversation-tails.ts). Group commit sends batches
+			// through `commit()`, or one `commit()` each (storage/commit-batch.ts), from a writer off the Session line
+			// (session/writer.ts) that gates reads by the keys of unpublished writes (session/keys.ts).
+			maxFiles: 83,
 			forbid: [
 				"packages/ai/src/index.ts",
 				"packages/ai/src/utils/typebox-helpers.ts",

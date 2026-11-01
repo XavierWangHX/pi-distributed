@@ -435,7 +435,7 @@ describe("tables in a transaction", () => {
 					order: "write",
 					apply: async () => {
 						await gate.promise;
-						return { kind: "dropIndex", table: "x", name: "y" };
+						return [{ kind: "dropIndex", table: "x", name: "y" }];
 					},
 				},
 			],
@@ -533,6 +533,22 @@ describe("persisted documents in a transaction", () => {
 		await store.close(context);
 	});
 
+	it("a keyed retirement takes 6a's statements: the counted DELETE, the revisions, lastSeq (cost guard)", async () => {
+		const { telemetry, context: counting, counts } = await metered();
+		const { self, k, store, host } = await stored(telemetry);
+		await self.tx(async (tx) => {
+			(await tx.draft(k, "a")).n = 1;
+		}, counting);
+		const before = { ...counts() };
+		await self.tx(async (tx) => {
+			await tx.retire(k, "a");
+		}, counting);
+		// No read of the record first, no second DELETE of its row; plus the outbox commit.
+		expect(counts()["chord.store.statements"]! - before["chord.store.statements"]!).toBe(4);
+		await host.close(context);
+		await store.close(context);
+	});
+
 	it("assign the created documents' ids by their order in the commit; retire and recreate in one commit", async () => {
 		const { self, k, store, host } = await stored();
 		await self.tx(async (tx) => {
@@ -548,9 +564,9 @@ describe("persisted documents in a transaction", () => {
 			writes.flatMap((write) => (write.kind === "document.create" ? [[write.record.key, write.record.id]] : [])),
 		);
 		expect(created).toEqual([
-			["b", 1],
-			["a", 2],
-			["b", 3],
+			["b", 2],
+			["a", 3],
+			["b", 4],
 		]);
 		expect(commits[1]!.writes.map(({ kind }) => kind)).toEqual(["document.retire", "document.create"]);
 		// What is stored of `b` is the new record's: the next change is a delta on it.
@@ -561,7 +577,7 @@ describe("persisted documents in a transaction", () => {
 			},
 			context,
 		);
-		expect((await store.outbox!.read(2, 10, context))[0]!.writes).toMatchObject([{ kind: "document.change", id: 3 }]);
+		expect((await store.outbox!.read(2, 10, context))[0]!.writes).toMatchObject([{ kind: "document.change", id: 4 }]);
 		await host.close(context);
 		await store.close(context);
 	});
@@ -644,7 +660,7 @@ describe("persisted documents in a transaction", () => {
 				apply: async () => {
 					inStep.resolve();
 					await gate.promise;
-					return { kind: "dropIndex", table: "x", name: "y" };
+					return [{ kind: "dropIndex", table: "x", name: "y" }];
 				},
 			};
 			return commit([...writes, held], fence, ctx);
@@ -700,7 +716,7 @@ describe("persisted documents in a transaction", () => {
 				apply: async () => {
 					inStep.resolve();
 					await gate.promise;
-					return { kind: "dropIndex", table: "x", name: "y" };
+					return [{ kind: "dropIndex", table: "x", name: "y" }];
 				},
 			};
 			return commit([...writes, held], fence, ctx);

@@ -20,7 +20,7 @@ const Edits = defineTable("edits", {
 	key: ["id"],
 	indexes: { by_at: ["at"] },
 });
-const TABLE = "session:app.store:edits";
+const TABLE = "app.store:edits";
 
 describe("the catalog", () => {
 	it("is read once at open: a reopened store knows its tables", async () => {
@@ -51,14 +51,12 @@ describe("the catalog", () => {
 			apply: (step) =>
 				step
 					.run("INSERT INTO no_such_table VALUES (1)")
-					.then(() => ({ kind: "dropIndex", table: TABLE, name: "x" })),
+					.then(() => [{ kind: "dropIndex", table: TABLE, name: "x" }]),
 		};
 		const table = stageTable({ kind: "table", table: TABLE, version, state: "ready", columns, key, fingerprint });
-		await expect(
-			store.commit([table, failing], { admit: () => true, adopt: () => {} }, context),
-		).rejects.toMatchObject({
-			reason: "storage_failed",
-		});
+		await expect(store.commit([table, failing], { admit: () => true, adopt: () => {} }, context)).rejects.toThrow(
+			"no such table",
+		);
 		expect(store.table(TABLE)).toBeUndefined();
 		await store.close(context);
 	});

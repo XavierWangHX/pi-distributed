@@ -29,7 +29,7 @@ const T = defineTable("edits", {
 
 describe("names", () => {
 	it("renders <host kind>:<object type>:<table>, quoted", () => {
-		expect(tableSqlName("session", "@pi/file-history.store", "edits")).toBe("session:@pi/file-history.store:edits");
+		expect(tableSqlName("@pi/file-history.store", "edits")).toBe("@pi/file-history.store:edits");
 		expect(quote("session:a:b")).toBe('"session:a:b"');
 	});
 });

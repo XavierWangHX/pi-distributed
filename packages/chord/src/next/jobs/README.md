@@ -105,8 +105,18 @@ host.serve(ChatStore, (_, self) => {
   only when it records something (`Transaction.staged` reads what it staged so far).
 - `JobOwner`: what a job needs of its object: label, host, caller, the object's context (without an abort signal),
   documents, `admit` (the drain) and `countRuns` (keep-alive and `host.activity.jobs`).
-- Inside: `JobRun` (one run: record, phase, abort signal, invocation fence closed as `run` settles, `running` entry,
-  the `Run` handle over its detachable waiters), the
+- Inside: `JobRun` (one run: record, phase, its current `Invocation`, `running` entry, the `Run` handle over its
+  detachable waiters; an `Invocation` is one call of `run` with its own seal token, abort signal and join, captured by
+  its ctx and its settling, so an invocation a seal replaced never writes or records for the next one), the
   run states (a keyed `DocumentHandle` by run id, apart from `self.state`'s, never drafted while absent) and `Running`
   (`running`'s list, copied per change; while watched it records the ops of each change, a run's state ops re-pathed
   under its entry, delivered as one frame per batch).
+
+Persisted jobs (slice 6b): `persist: { resume: "rerun" | "abandon" }` in a `local` type with empty params. Each
+unsettled run's record (`stored.ts`) is a document in `chord.jobs`, its state one in `chord.job-states`
+(`persisted.ts`, `run-states.ts`); a run is reserved (`running`) before `run`, counted after a crash (five in a row end it
+`restart_limit`), written back `stopped` by the close writer after the drain, resumed on the next live attempt (per
+`resume`); the records load once per object, again only after a load failed, a record of another version or fingerprint
+blocked before its state is decoded; `abort(id, ctx)` is stored and joins the current invocation;
+`ctx.state.change(fn, ctx, { persistence: { kind: "deferred" } })` holds a change (its ops folded in a `PendingOps`) until
+the next immediate one, the outcome, the close writer or its deadline (one timer per object).

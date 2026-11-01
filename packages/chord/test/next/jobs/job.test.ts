@@ -34,6 +34,7 @@ import {
 	loaded,
 	metered,
 	rejection,
+	Server,
 	type TestPrincipal,
 	transported,
 } from "../support.ts";
@@ -325,23 +326,27 @@ describe("start", () => {
 		expect(log.value.list).toEqual(["written with the start", "from run a"]);
 	});
 
-	it("starts run with its signal aborted after an abort between the commit and its start", async () => {
+	it("an abort between the commit and the start is marked, then the signal fires; the abort joins run (D7)", async () => {
 		let signalled: boolean | undefined;
 		const { job } = await declared(Echo, () => ({
 			run: async ({ text }, ctx) => {
+				await new Promise((resolve) => setTimeout(resolve, 20));
 				signalled = ctx.abortSignal?.aborted;
 				return text;
 			},
 		}));
 		const watch = await job.running.watch(context);
+		const aborts: Promise<string>[] = [];
 		// The watch's frame of the start's commit arrives before `run` starts.
 		watch.start(async (call) => {
-			if (call.kind !== "value") return;
-			for (const entry of call.value) job.abort(entry.id);
+			if (call.kind !== "value" || aborts.length > 0) return;
+			for (const entry of call.value) aborts.push(job.abort(entry.id, context));
 		});
 		const run = await job.start({ text: "a" }, context);
 		expect(await run.outcome(context)).toMatchObject({ kind: "done", result: "a" });
 		expect(signalled).toBe(true);
+		expect(await Promise.all(aborts)).toEqual(["marked"]);
+		expect(await job.abort(run.id, context)).toBe("terminal");
 		await watch.stop();
 	});
 
@@ -578,7 +583,7 @@ describe("run", () => {
 		}));
 		const run = await job.start({ command: "a" }, context);
 		await flushed();
-		job.abort(run.id);
+		void job.abort(run.id, context);
 		expect(await run.outcome(context)).toEqual({
 			id: run.id,
 			args: { command: "a" },
@@ -598,7 +603,7 @@ describe("run", () => {
 		}));
 		const run = await job.start({ text: "kept" }, context);
 		await flushed();
-		job.abort(run.id);
+		void job.abort(run.id, context);
 		expect(await run.outcome(context)).toMatchObject({ kind: "done", result: "kept" });
 	});
 
@@ -779,7 +784,7 @@ describe("finish", () => {
 			const other = await job.start({ command: "c" }, context, { key: "other" });
 			await vi.advanceTimersByTimeAsync(0);
 			expect(job.running.value.map((entry) => entry.phase)).toEqual(["blocked", "finishing"]);
-			job.abort(run.id);
+			void job.abort(run.id, context);
 			await vi.advanceTimersByTimeAsync(0);
 			expect(await dropped).toMatchObject({ code: "aborted" });
 			expect(job.running.value.map((entry) => entry.id)).toEqual([other.id]);
@@ -819,7 +824,7 @@ describe("finish", () => {
 		}));
 		const run = await job.start({ text: "a" }, context);
 		await flushed();
-		job.abort(run.id);
+		void job.abort(run.id, context);
 		gate.resolve();
 		expect((await run.outcome(context)).kind).toBe("done");
 	});
@@ -1053,11 +1058,12 @@ describe("keep-alive", () => {
 		const View = remote("app.view", {
 			version: 1,
 			params: {},
+			hostAddress: () => Server(),
 			variants: { v: { state: { running: arr(unknown()) } } },
 		});
 		let job: JobHandle<{ text: string }, string, undefined> | undefined;
 		let ran = false;
-		const server = createHost<TestPrincipal>({ principal: { kind: "server" }, onError: () => {} });
+		const server = createHost<TestPrincipal>({ address: Server(), principal: { kind: "server" }, onError: () => {} });
 		const facet = defineFacet<TestPrincipal>((h) =>
 			h.serve(View, (_, _principal, self) => {
 				job = self.job(Echo, {
@@ -1153,13 +1159,19 @@ describe("keep-alive", () => {
 
 describe("object end", () => {
 	type Revocation = { session: string };
-	const Jobs = remote("app.jobs", { version: 1, params: {}, variants: { v: { state: {} } } });
+	const Jobs = remote("app.jobs", {
+		version: 1,
+		params: {},
+		hostAddress: () => Server(),
+		variants: { v: { state: {} } },
+	});
 
 	it("revocation (R11): runs' signals fire with the end's error, the drain waits for them, no finish", async () => {
 		let job: JobHandle<{ text: string }, string, undefined> | undefined;
 		const finished: string[] = [];
 		let reason: unknown;
 		const server = createHost<TestPrincipal, Revocation>({
+			address: Server(),
 			principal: { kind: "server" },
 			revokedBy: (p) => (p.kind === "guest" ? [{ session: p.session }] : []),
 			onError: () => {},
@@ -1205,6 +1217,7 @@ describe("object end", () => {
 		const gate = Promise.withResolvers<void>();
 		const events: string[] = [];
 		const server = createHost<TestPrincipal, Revocation>({
+			address: Server(),
 			principal: { kind: "server" },
 			revokedBy: (p) => (p.kind === "guest" ? [{ session: p.session }] : []),
 			onError: () => {},
@@ -1299,7 +1312,7 @@ describe("GC", () => {
 				() => new Error("expected a rejection"),
 				(error: Error) => error,
 			);
-			job.abort(run.id);
+			void job.abort(run.id, context);
 			await vi.advanceTimersByTimeAsync(0);
 			expect(await dropped).toMatchObject({ code: "aborted" });
 			expect(job.running.value).toEqual([]);

@@ -12,6 +12,15 @@ import { validatorFor } from "../data/internal.ts";
 /** A document root: a JSON object. */
 export type JsonObject = { [key: string]: JsonValue };
 
+/**
+ * When a commit reaches the store (Durable's `CommitPersistence`): `immediate`, the default, before the commit
+ * resolves; `deferred` (a persisted run's state change, D8): adopted and published at once, stored with the next
+ * immediate change, the run's outcome, the object's close, or about `withinMs` (default 1,000 ms) later.
+ */
+export type CommitPersistence =
+	| { readonly kind: "immediate" }
+	| { readonly kind: "deferred"; readonly withinMs?: number };
+
 /** What a persisted document's `checkpointWhen` learns of its stored revisions. */
 export type CheckpointInfo = {
 	/** The deltas stored after its newest base, without the change being decided. */

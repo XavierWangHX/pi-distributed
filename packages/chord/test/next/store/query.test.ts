@@ -51,36 +51,32 @@ describe("cursors", () => {
 	const order = query(T).orderBy((e) => e.at, "desc").order;
 
 	it("round-trip the order values, also across conditions with the same order", () => {
-		const cursor = encodeCursor("client:app:edits", order, [5, "a\u{1F600}", 2]);
+		const cursor = encodeCursor("app:edits", order, [5, "a\u{1F600}", 2]);
 		expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
-		expect(decodeCursor(T, "client:app:edits", order, cursor)).toEqual([5, "a\u{1F600}", 2]);
+		expect(decodeCursor(T, "app:edits", order, cursor)).toEqual([5, "a\u{1F600}", 2]);
 		const other = query(T)
 			.where((e) => eq(e.id, "x"))
 			.orderBy((e) => e.at, "desc").order;
-		expect(decodeCursor(T, "client:app:edits", other, cursor)).toEqual([5, "a\u{1F600}", 2]);
+		expect(decodeCursor(T, "app:edits", other, cursor)).toEqual([5, "a\u{1F600}", 2]);
 	});
 
 	it("are a trust boundary: another table, order or direction, garbage and bad values are invalid/args", () => {
-		const cursor = encodeCursor("client:app:edits", order, [5, "a", 2]);
-		expect(() => decodeCursor(T, "client:app:edits", query(T).order, cursor)).toThrow(args);
-		expect(() => decodeCursor(T, "client:app:edits", query(T).orderBy((e) => e.at).order, cursor)).toThrow(args);
+		const cursor = encodeCursor("app:edits", order, [5, "a", 2]);
+		expect(() => decodeCursor(T, "app:edits", query(T).order, cursor)).toThrow(args);
+		expect(() => decodeCursor(T, "app:edits", query(T).orderBy((e) => e.at).order, cursor)).toThrow(args);
 		expect(() =>
 			decodeCursor(
 				defineTable("other", { version: 1, columns: { id: str(), entry: int(), at: int() }, key: ["id", "entry"] }),
-				"client:app:other",
+				"app:other",
 				order,
 				cursor,
 			),
 		).toThrow(args);
 		// The same definition in another object's table.
-		expect(() => decodeCursor(T, "client:other:edits", order, cursor)).toThrow(args);
-		expect(() => decodeCursor(T, "client:app:edits", order, "%%%")).toThrow(args);
-		expect(() => decodeCursor(T, "client:app:edits", order, 42)).toThrow(args);
-		expect(() =>
-			decodeCursor(T, "client:app:edits", order, encodeCursor("client:app:edits", order, ["x", "a", 2])),
-		).toThrow(args);
-		expect(() =>
-			decodeCursor(T, "client:app:edits", order, encodeCursor("client:app:edits", order, [5, "a"])),
-		).toThrow(args);
+		expect(() => decodeCursor(T, "other:edits", order, cursor)).toThrow(args);
+		expect(() => decodeCursor(T, "app:edits", order, "%%%")).toThrow(args);
+		expect(() => decodeCursor(T, "app:edits", order, 42)).toThrow(args);
+		expect(() => decodeCursor(T, "app:edits", order, encodeCursor("app:edits", order, ["x", "a", 2]))).toThrow(args);
+		expect(() => decodeCursor(T, "app:edits", order, encodeCursor("app:edits", order, [5, "a"]))).toThrow(args);
 	});
 });

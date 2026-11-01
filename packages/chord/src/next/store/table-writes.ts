@@ -86,12 +86,12 @@ export type TableDefinitionWrite = Extract<TableWrite, { readonly kind: "table" 
 
 /** Stages a `table` write: the table created when the store does not have it yet, its record replaced otherwise. */
 export function stageTable(write: TableDefinitionWrite): StagedWrite {
-	return { order: "write", apply: (step) => applyTable(step, write) };
+	return { order: "write", apply: async (step) => [await applyTable(step, write)] };
 }
 
 /** Stages an `index` write. */
 export function stageIndex(write: Extract<TableWrite, { readonly kind: "index" }>): StagedWrite {
-	return { order: "write", apply: (step) => applyIndex(step, write) };
+	return { order: "write", apply: async (step) => [await applyIndex(step, write)] };
 }
 
 /** Stages one edit of the migration of `table` to `version` as its `alter`, `index` or `dropIndex` write. */
@@ -101,11 +101,11 @@ export function stageEdit(table: string, version: number, edit: TableEdit): Stag
 			return stageIndex({ kind: "index", table, name: edit.name, columns: edit.columns });
 		case "dropIndex": {
 			const write = { kind: "dropIndex", table, name: edit.name } as const;
-			return { order: "write", apply: (step) => applyDropIndex(step, write) };
+			return { order: "write", apply: async (step) => [await applyDropIndex(step, write)] };
 		}
 		default: {
 			const write = { kind: "alter", table, version, edit } as const;
-			return { order: "write", apply: (step) => applyAlter(step, write) };
+			return { order: "write", apply: async (step) => [await applyAlter(step, write)] };
 		}
 	}
 }
@@ -117,7 +117,7 @@ export function stagePut(sql: string, table: string, row: EncodedRow, version: n
 		order: "write",
 		apply: async (step) => {
 			await step.run(sql, ...row.params);
-			return write;
+			return [write];
 		},
 	};
 }
@@ -167,7 +167,7 @@ export function stageDeleteWhere(statement: Statement, table: string, where: Whe
 function counted(statement: Statement, record: (count: number) => TableWrite): StagedWrite {
 	return {
 		order: "write",
-		apply: async (step) => record(await step.runCounted(statement.sql, ...statement.params)),
+		apply: async (step) => [record(await step.runCounted(statement.sql, ...statement.params))],
 	};
 }
 

@@ -6,7 +6,7 @@ import type { Context } from "../../context/index.ts";
 import { ChordError } from "../data/index.ts";
 import type { Batch } from "../state/internal.ts";
 import type { ChordStore } from "../store/store.ts";
-import type { JsonObject, StateDefinition } from "./definition.ts";
+import type { CommitPersistence, JsonObject, StateDefinition } from "./definition.ts";
 import { SealToken } from "./fence.ts";
 import { type HandleOf, type KeyDeclarer, Keyed, Singleton } from "./handles.ts";
 import { KeyedSlot } from "./keyed-slot.ts";
@@ -23,7 +23,7 @@ export type DocumentsOwner = {
 	readonly batch: Batch;
 	/** The object's context: shared cold loads run under it (rule 11). */
 	readonly context: Context;
-	/** The host's store and the object's owner string in it (`<host kind>:<object type>`, W7), when it has one. */
+	/** The host's store and the object's owner name in it (its type, R2), when it has one. */
 	readonly store: { readonly store: ChordStore; readonly owner: string } | undefined;
 	/** A document the code cannot read fails the live object `broken` (slice 6a §1.4); ignored when it is not live. */
 	fail(error: ChordError): void;
@@ -87,6 +87,14 @@ export class Documents {
 	}
 
 	/**
+	 * Checks a declaration of `definition` as `declare` would, changing nothing (a reload's staging: a recording factory
+	 * declares against the documents the object has).
+	 */
+	check(definition: AnyDefinition): void {
+		this.#slots.get(definition.name)?.definition.check(definition);
+	}
+
+	/**
 	 * Takes an attempt's declarations once its factory returned: its `at(key)` pins replace the previous factory's, the
 	 * slots it no longer declares are dropped (their watches end; persisted ones load again when declared again), every
 	 * declared one hydrated (`initial()`, migrations; a throw fails the activation).
@@ -137,13 +145,19 @@ export class Documents {
 
 	/**
 	 * Runs `fn` as one transaction on the line under `token` and commits what it drafted (§9): a throw, an abort of
-	 * `context`, the token's seal or the object's end discards everything.
+	 * `context`, the token's seal or the object's end discards everything. `persistence` defers storing a run state's
+	 * change (D8).
 	 */
-	async tx<R>(fn: (tx: Transaction) => R | Promise<R>, token: SealToken, context: Context): Promise<R> {
+	async tx<R>(
+		fn: (tx: Transaction) => R | Promise<R>,
+		token: SealToken,
+		context: Context,
+		persistence?: CommitPersistence,
+	): Promise<R> {
 		this.batch.assertOutside("tx");
 		this.assertAdmitted(token);
 		const release = await this.line.acquire();
-		const tx = new Transaction(this, token, release, context);
+		const tx = new Transaction(this, token, release, context, persistence);
 		try {
 			this.assertAdmitted(token);
 			this.#holder = tx;
@@ -232,6 +246,6 @@ export class Documents {
 	/** The store side of persisted documents named `name`; the attempt checked the store first (P3). */
 	#persistence(name: string): Persistence {
 		const { store, owner } = this.#owner.store!;
-		return new Persistence(store, owner, name);
+		return new Persistence(store, owner, "chord", name);
 	}
 }

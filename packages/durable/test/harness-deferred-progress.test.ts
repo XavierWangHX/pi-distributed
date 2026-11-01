@@ -161,7 +161,8 @@ describe("generation partials", () => {
 		const submission = await opened.root.submit({ type: "input", content: "hi" }, context);
 		await waitFor(() => (opened.memory.at(-1)?.length ?? 0) > 40);
 		await crash(opened.harness);
-		expect(await storedLive(storage, opened.root.id)).toMatchObject({ generation: { attempt: 1 } });
+		// The attempt is presentation, deferred like the partials: none of it was stored.
+		expect((await storedLive(storage, opened.root.id))?.generation).toBeUndefined();
 		expect(storedText(await storedLive(storage, opened.root.id))).toBeUndefined();
 
 		setup.faux.setResponses([fauxAssistantMessage("answer")]);

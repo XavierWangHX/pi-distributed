@@ -14,6 +14,7 @@ import { performance } from "node:perf_hooks";
 import { defineDoc } from "../../../../durable/src/documents.ts";
 import { createSession } from "../../../../durable/src/session/session.ts";
 import { SqliteStorage } from "../../../../durable/src/storage/sqlite/storage.ts";
+import { commitWrites } from "../../../../durable/src/testing/commit-writes.ts";
 import { BACKGROUND_CONTEXT as context } from "../../../src/context/index.ts";
 import { int, local, method, obj, str } from "../../../src/next/contracts/index.ts";
 import { defineState, type SingletonHandle } from "../../../src/next/documents/index.ts";
@@ -78,7 +79,7 @@ function chordDeltas(outbox: boolean) {
 		const store = (await openStore(sqliteBackend(await openNodeSqliteDatabase(path)), context, {
 			outbox,
 		})) as ChordStore;
-		const address = { namespace: "chord", owner: "session:bench.store", kind: "note", key: "" };
+		const address = { namespace: "chord", owner: "bench.store", kind: "note", key: "" };
 		const base = { version: 1, fingerprint: "0123456789abcdef", value: VALUE };
 		let id = 0;
 		const fence = {
@@ -87,7 +88,7 @@ function chordDeltas(outbox: boolean) {
 				id = ids[0] ?? id;
 			},
 		};
-		await store.commit([createDocument(address, "latest", base, JSON.stringify(VALUE))], fence, context);
+		await store.commit([createDocument(address, base, JSON.stringify(VALUE))], fence, context);
 		return {
 			commit: (index: number) => {
 				const ops = [["s", ["n"], index + 1]] as const;
@@ -111,18 +112,18 @@ async function durableDeltas() {
 	const storage = await SqliteStorage.open(await openNodeSqliteDatabase(path));
 	const id = await storage.mintId();
 	const record = { id, kind: "note", scope: { kind: "session" } } as never;
-	await storage.commit(
+	await commitWrites(
+		storage,
 		[{ type: "document.create", record, content: { kind: "base", version: 1, value: VALUE } }],
-		() => {},
 		context,
 	);
 	return {
 		commit: (index: number) =>
-			storage.commit(
+			commitWrites(
+				storage,
 				[
 					{ type: "document.change", id, content: { kind: "delta", version: 1, ops: [["s", ["n"], index + 1]] } },
 				] as never,
-				() => {},
 				context,
 			),
 		close: async () => {
@@ -149,7 +150,7 @@ function chordPuts(outbox: boolean) {
 		const store = (await openStore(sqliteBackend(await openNodeSqliteDatabase(path)), context, {
 			outbox,
 		})) as ChordStore;
-		const table = tableSqlName("session", "bench.store", Edits.name);
+		const table = tableSqlName("bench.store", Edits.name);
 		const sql = new TableSql(table, Edits.columns, Edits.rows.physical, Edits.key);
 		const fence = { admit: () => true, adopt: () => {} };
 		const { version, record: columns, key, fingerprint } = Edits;
@@ -178,14 +179,14 @@ function chordPuts(outbox: boolean) {
 async function durableEntries() {
 	const { path, remove } = await file();
 	const storage = await SqliteStorage.open(await openNodeSqliteDatabase(path));
-	await storage.commit([{ type: "conversation", value: { id: 1 } }] as never, () => {}, context);
+	await commitWrites(storage, [{ type: "conversation", value: { id: 1 } }] as never, context);
 	return {
 		commit: async (index: number) => {
 			const id = await storage.mintId();
 			const data = { path: `src/file${index % 50}.ts`, at: index, body: VALUE.body };
-			return storage.commit(
+			return commitWrites(
+				storage,
 				[{ type: "entry", value: { id, conversationId: 1, kind: "edit", data } }] as never,
-				() => {},
 				context,
 			);
 		},
@@ -329,7 +330,7 @@ console.log(`heap after GC: ${heap() - before} KiB above the start`);
 async function filledEdits(count: number, body = VALUE.body, definition: typeof Edits = Edits) {
 	const { path, remove } = await file();
 	const store = (await openStore(sqliteBackend(await openNodeSqliteDatabase(path)), context)) as ChordStore;
-	const table = tableSqlName("session", "bench.store", Edits.name);
+	const table = tableSqlName("bench.store", Edits.name);
 	const fence = { admit: () => true, adopt: () => {} };
 	await prepareTables([{ definition, table }], store, fence, "bench", context);
 	const handle = new TableHandle(definition, table, store, {

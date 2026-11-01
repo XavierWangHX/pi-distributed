@@ -1,9 +1,11 @@
 import type { Context, JsonValue, WatchHandle } from "@earendil-works/chord";
 import type {
+	Api,
 	AssistantMessage,
 	CacheRetention,
 	ClientIdentity,
 	Message,
+	Model,
 	Models,
 	ModelThinkingLevel,
 	Static,
@@ -25,6 +27,7 @@ import type {
 	Cursor,
 	DocumentObserver,
 	DocumentReader,
+	Entry,
 	EntryDraft,
 	EntryId,
 	EntryQuery,
@@ -44,6 +47,7 @@ import type {
 	TaskRecord,
 	TaskState,
 	Tx,
+	TypedEntry,
 } from "../types.ts";
 import type { TaskGraph, TaskGraphWatch } from "./task-graph.ts";
 import type { UsageState } from "./usage.ts";
@@ -75,6 +79,12 @@ export type SubmissionDraft = {
 			readonly type: "input";
 			readonly content: UserInput;
 			readonly whenBusy?: "steer" | "followUp" | "reject";
+			/**
+			 * `reject`: an idle conversation (no run) rejects the input with `ConversationIdle` and writes nothing, so the input
+			 * never starts a run of its own. With `whenBusy: "steer"` it steers the current run or is refused; a run that
+			 * answered and waits for its `afterRun` tasks is still busy, and such an input queues and starts the next run.
+			 */
+			readonly whenIdle?: "reject";
 			/** Place the input as this entry; default `pi.user` without data. The kind must not start with `pi.`. */
 			readonly entry?: InputEntry;
 	  }
@@ -83,6 +93,7 @@ export type SubmissionDraft = {
 			readonly entry: EntryDraft;
 			readonly content?: never;
 			readonly whenBusy?: never;
+			readonly whenIdle?: never;
 	  }
 	| {
 			/**
@@ -96,6 +107,7 @@ export type SubmissionDraft = {
 			readonly content?: never;
 			readonly entry?: never;
 			readonly whenBusy?: never;
+			readonly whenIdle?: never;
 	  }
 );
 
@@ -145,12 +157,15 @@ export type HooksOf<K> = K extends Task<infer _I, infer _S, infer _R, infer H> ?
 
 /**
  * Invocation-bound conversation operations for tasks and tools. Rejects after the invocation ends. `submit` takes any
- * submission, as `Conversation.submit()` does: a subagent's conversation is an ordinary one, so a tool may also continue
- * it.
+ * submission, in both forms of `Conversation.submit()`: a subagent's conversation is an ordinary one, so a tool may also
+ * continue it, and a task may admit a submission in the same commit as its own writes (`runtime.commit()`); entries
+ * the admission appends there carry the task's `byTaskId`. The transaction form also rejects once the invocation is
+ * aborted.
  */
 export interface ConversationHandle {
 	readonly id: ConversationId;
 	submit(submission: SubmissionDraft, context: Context): Promise<Submission>;
+	submit(tx: Tx, submission: SubmissionDraft): Promise<SubmissionId>;
 	/** `Conversation.abort()`: withdraw queued inputs, abort the ordinary ownership scope, and wait until it is idle. */
 	abort(context: Context, options?: ConversationAbortOptions): Promise<void>;
 	/** Resolve when the conversation's ordinary ownership scope has no live non-background task. */
@@ -788,11 +803,23 @@ export interface Conversation {
 	/**
 	 * Durably admit user input, a passive entry write, or a continue. A busy conversation, or one with queued items,
 	 * queues input and writes that affect model context in `pi.inbox`; `whenBusy: "reject"` rejects input with
-	 * `ConversationBusy` instead and writes nothing. A write of only `kind` and `data` (no `model`, `head`, or `edits`)
+	 * `ConversationBusy` instead and writes nothing. An idle conversation rejects `whenIdle: "reject"` input with
+	 * `ConversationIdle` and writes nothing. A write of only `kind` and `data` (no `model`, `head`, or `edits`)
 	 * is appended at once, even mid-run, as it changes nothing the model sees. A continue starts a run on the context as
 	 * it is, after placing queued items; a busy conversation rejects it with `ConversationBusy`, as it never queues.
 	 */
 	submit(submission: SubmissionDraft, context: Context): Promise<Submission>;
+	/**
+	 * Admit a submission inside the caller's commit `tx` (`Harness.commit()`, `Conversation.commit()`, a task's
+	 * `runtime.commit()`), with the same rules, and return its ID: the admission is stored with that commit, or not at all
+	 * when the callback throws later or the commit fails. Call it before the commit's first table write (`appendEntry()`,
+	 * `createTask()`, `createSubmission()`, another admission): otherwise it throws `ReadAfterWrite`, on every path.
+	 * Documents may be read and written before and after it. A rejection (`ConversationBusy`, `ConversationIdle`) throws
+	 * before any write, so the callback may catch it. Do not call `Submission` or other Harness reads inside the callback:
+	 * they wait for the commit holding the line. Its `pi.durable.submit` span covers the admission only, so its `result`
+	 * is provisional. Throws for a transaction of another Session.
+	 */
+	submit(tx: Tx, submission: SubmissionDraft): Promise<SubmissionId>;
 	/**
 	 * Admit a write of a `pi.reset` entry that starts a new context, carrying `handoff` as a user message when given.
 	 * Resolves after admission; while busy, it is placed at the next boundary.
@@ -911,7 +938,10 @@ export interface Harness extends Session {
 	observeTaskGraph(observer: Observer<TaskGraph>, context: Context): Promise<Observation<TaskGraph>>;
 }
 
-/** What a hook may use: committed reads and the asking task's memos, which hooks and the task share. */
+/**
+ * What a hook may use: committed reads and the asking task's memos, which hooks and the task share. Hooks run off the
+ * Session line, so reads see what is committed when they run; a hook rerun after a crash may see more.
+ */
 export interface HookApi extends DocumentReader {
 	readonly taskId: TaskId;
 	readonly conversationId: ConversationId;
@@ -919,6 +949,17 @@ export interface HookApi extends DocumentReader {
 	readonly models: Models;
 	memo<T extends JsonValue>(name: string, context: Context): Promise<T | undefined>;
 	memo<T extends JsonValue>(name: string, candidate: T, context: Context): Promise<T>;
+	/** Committed entry visible from the task's conversation, as `TaskRuntime.entry()`. */
+	entry(id: EntryId, context: Context): Promise<EntryRecord | undefined>;
+	/** Undefined when the entry is absent, not visible, or has another kind. */
+	entry<D extends JsonValue>(token: Entry<D>, id: EntryId, context: Context): Promise<TypedEntry<D> | undefined>;
+	/** Committed raw history of the task's conversation, as `TaskRuntime.entries()`. */
+	entries(
+		query: Omit<EntryQuery, "conversationId">,
+		limit: number,
+		cursor: Cursor | undefined,
+		context: Context,
+	): Promise<Page<EntryRecord, Cursor>>;
 }
 
 export type HookResult<T> = T | undefined | Promise<T | undefined>;
@@ -931,13 +972,49 @@ export interface GenerationHooks {
 		api: HookApi,
 		context: Context,
 	): HookResult<{ readonly messages: readonly Message[] }>;
+	/**
+	 * After pi-ai builds the provider request body, before it is sent; the result replaces the body for that request only.
+	 * Runs again whenever pi-ai rebuilds the body, such as a retry within one attempt. The body is in the provider API's
+	 * own format (`request.model.api`), so a hook checks the API before changing it.
+	 */
+	beforeProviderRequest(
+		request: { readonly model: Model<Api>; readonly payload: unknown },
+		api: HookApi,
+		context: Context,
+	): HookResult<{ readonly payload: unknown }>;
 	/** Every terminal provider message, before classification. */
 	afterResponse(message: AssistantMessage, api: HookApi, context: Context): void | Promise<void>;
 	/** A final answer; the first `continue` appends a user message and continues the run. */
 	onYield(answer: AssistantMessage, api: HookApi, context: Context): HookResult<{ readonly continue: UserInput }>;
 	/** After every tool of the round is terminal; `results` are the round's result entries in call order. */
 	afterTools(assistant: EntryId, results: readonly EntryId[], api: HookApi, context: Context): void | Promise<void>;
+	/**
+	 * After a run answered, its answer committed and its inputs settled `done`: a final answer, or a `terminate` round;
+	 * not when an `onYield` continuation is taken, and never after a failure or an abort. The requested tasks of every
+	 * hook are created together as children of the generation, which keeps the run, and the conversation busy, until
+	 * they are terminal; then queued items are placed and the run ends (spec §8.3). A crash before they are created asks
+	 * again; once created, never again for this run.
+	 */
+	afterRun(run: RunSummary, api: HookApi, context: Context): HookResult<{ readonly tasks: readonly RunEndTask[] }>;
 }
+
+/** How a run ended, for `afterRun` hooks. Read the run's history with `api.entries({ minEntryId: first, maxEntryId: last })`. */
+export type RunSummary = {
+	/** A final answer, or a tool round whose every call asked to `terminate`. */
+	readonly reason: "answer" | "terminate";
+	/**
+	 * The run's first entry (`LiveRun.first`): the first one the boundary that started it placed, for a continue the failed
+	 * run's it continues, otherwise its first tool-calling answer; the answer itself for a run that has none of these.
+	 */
+	readonly first: EntryId;
+	/** The answer, or the terminating round's tool-calling answer, whose results follow it. */
+	readonly answer: EntryId;
+	/** The run's last entry: the answer; for a `terminate` round its newest result, or the reset of its handoff. */
+	readonly last: EntryId;
+};
+
+/** A task an `afterRun` hook asks for, built by `runEndTask()`. */
+export type RunEndTask = { readonly task: AnyTask; readonly input: JsonValue };
 
 /** A call as tool hooks see it; `parent` is set for a nested call, one a running tool made through `executeTool()`. */
 export type ToolHookCall = ToolCall & {

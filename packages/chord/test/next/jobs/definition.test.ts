@@ -96,11 +96,34 @@ describe("defineJob", () => {
 		);
 	});
 
-	it("refuses persist before slice 6, in its final shape", () => {
-		expect(() => defineJob("j", { version: 1, args, result: int(), persist: { resume: "rerun" } })).toThrow(
-			"j.persist: persisted jobs are not supported before slice 6",
+	it("takes persist with a resume rule, a persisted state and a JSON-only result (slice 6b §4)", () => {
+		const Persisted = defineState("p.state", {
+			schema: obj({ n: int() }),
+			version: 1,
+			initial: () => ({ n: 0 }),
+			persist: true,
+			checkpointWhen: () => true,
+		});
+		const InMemory = defineState("m.state", { schema: obj({ n: int() }), version: 1, initial: () => ({ n: 0 }) });
+		const job = defineJob("j", { version: 1, args, result: int(), state: Persisted, persist: { resume: "rerun" } });
+		expect(job.persist).toEqual({ resume: "rerun" });
+		expect(() =>
+			defineJob("j", { version: 1, args, result: int(), state: InMemory, persist: { resume: "abandon" } }),
+		).toThrow("a persisted job's state is a persisted document");
+		expect(() => defineJob("j", { version: 1, args, result: bytes(), persist: { resume: "rerun" } })).toThrow(
+			"a persisted job's result is JSON",
 		);
+		// An in-memory job may return bytes.
+		expect(() => defineJob("j", { version: 1, args, result: bytes() })).not.toThrow();
 		// @ts-expect-error: resume is required
-		expect(() => defineJob("j", { version: 1, args, result: int(), persist: {} })).toThrow();
+		expect(() => defineJob("j", { version: 1, args, result: int(), persist: {} })).toThrow(
+			'expected "rerun" or "abandon"',
+		);
+	});
+
+	it("fingerprints args, result and state: a schema change without a version bump changes it", () => {
+		const one = defineJob("j", { version: 1, args, result: int() });
+		expect(defineJob("j", { version: 1, args, result: int() }).fingerprint).toBe(one.fingerprint);
+		expect(defineJob("j", { version: 1, args, result: str() }).fingerprint).not.toBe(one.fingerprint);
 	});
 });

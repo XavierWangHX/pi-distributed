@@ -17,8 +17,8 @@ async function collect<T>(values: AsyncIterable<T>): Promise<T[]> {
 }
 
 const PARTS: ArchivePart[] = [
-	{ kind: "manifest", format: 1, schema: 1, lastSeq: 3, nextDocumentId: 2 },
-	{ kind: "put", table: "client:app.store:edits", row: { id: "ü€😀", n: 1 }, version: 1, columns: {} },
+	{ kind: "manifest", format: 1, schema: 1, lastSeq: 3, nextId: 2 },
+	{ kind: "put", table: "app.store:edits", row: { id: "ü€😀", n: 1 }, version: 1, columns: {} },
 	{ kind: "end", writes: 1 },
 ];
 

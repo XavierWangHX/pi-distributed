@@ -119,6 +119,7 @@ describe("subscribers", () => {
 		const subscriber: Subscriber = {
 			advance: (call) => void (call.kind === "value" && frames.push([call.value, call.ops])),
 			end: () => {},
+			endAfterDelivery: () => {},
 		};
 		source.subscribe(subscriber);
 		expect(source.watched).toBe(true);

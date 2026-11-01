@@ -10,7 +10,7 @@ import type { SqliteValue } from "../../sqlite/index.ts";
 import { ChordError } from "../data/index.ts";
 import { ARCHIVE_FORMAT, type ArchivePart } from "./archive.ts";
 import type { TableRecord } from "./catalog.ts";
-import { listDocuments, loadDocument } from "./engine.ts";
+import { listRecords, listRevisions } from "./engine.ts";
 import { ROW_VERSION, type Scalar, versionColumn } from "./rows.ts";
 import { STORE_SCHEMA } from "./schema.ts";
 import { quote, recordedPut } from "./sql.ts";
@@ -116,8 +116,8 @@ async function* parts(
 	hold(release);
 	try {
 		if (context.abortSignal?.aborted) throw aborted(context);
-		const { lastSeq, nextDocumentId } = store;
-		yield { kind: "manifest", format: ARCHIVE_FORMAT, schema: STORE_SCHEMA, lastSeq, nextDocumentId };
+		const { lastSeq, nextId } = store;
+		yield { kind: "manifest", format: ARCHIVE_FORMAT, schema: STORE_SCHEMA, lastSeq, nextId };
 		let writes = 0;
 		const tables = [...store.tables.values()].sort((a, b) => (a.table < b.table ? -1 : 1));
 		for (const record of tables) {
@@ -133,8 +133,8 @@ async function* parts(
 				writes++;
 			}
 		}
-		for await (const create of documents(store, context)) {
-			yield create;
+		for await (const part of documents(store, context)) {
+			yield part;
 			writes++;
 		}
 		yield { kind: "end", writes };
@@ -188,20 +188,37 @@ function putOf(
 	return { kind: "put", table: record.table, row, version: stored[ROW_VERSION] as number, columns: versions };
 }
 
-/** The live documents by id as their creations: the record and the current value as the base. */
+/**
+ * Every stored record by id, live and retired, as its creation without a base, then its kept revisions in seq order:
+ * a `none` or `latest` record's current base and its deltas, a retired `latest` one none, a `rewindable` one all.
+ */
 async function* documents(
 	store: ChordStore,
 	context: Context,
-): AsyncGenerator<Extract<ArchivePart, { readonly kind: "document.create" }>> {
+): AsyncGenerator<Extract<ArchivePart, { readonly kind: "document.create" | "document.revision" }>> {
 	let after = 0;
 	for (;;) {
-		const records = await store.read((executor) => listDocuments(executor, after, EXPORT_PAGE), context);
+		const records = await store.read((executor) => listRecords(executor, after, EXPORT_PAGE), context);
 		for (const record of records) {
-			const { value } = await store.read((executor) => loadDocument(executor, record), context);
-			const { version, fingerprint } = record;
-			yield { kind: "document.create", record, base: { version, fingerprint, value } };
+			yield { kind: "document.create", record };
+			yield* revisions(store, record.id, context);
 		}
 		if (records.length < EXPORT_PAGE) return;
 		after = records.at(-1)!.id;
+	}
+}
+
+/** Document `id`'s kept revisions in seq order, read page by page (a long history is never one array). */
+async function* revisions(
+	store: ChordStore,
+	id: number,
+	context: Context,
+): AsyncGenerator<Extract<ArchivePart, { readonly kind: "document.revision" }>> {
+	let after = 0;
+	for (;;) {
+		const page = await store.read((executor) => listRevisions(executor, id, after, EXPORT_PAGE), context);
+		for (const revision of page) yield { kind: "document.revision", ...revision };
+		if (page.length < EXPORT_PAGE) return;
+		after = page.at(-1)!.seq;
 	}
 }

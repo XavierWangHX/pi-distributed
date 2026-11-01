@@ -9,5 +9,5 @@ export {
 	type Outcome,
 } from "./definition.ts";
 export type { JobCtx, JobHandle, JobImplementation, RunState, StartOptions } from "./job.ts";
-export type { Run } from "./run.ts";
+export type { BlockedReason, Run } from "./run.ts";
 export type { RunningEntry } from "./running.ts";

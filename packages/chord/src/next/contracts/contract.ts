@@ -97,8 +97,8 @@ export type ContractData = {
 	readonly kind: Kind;
 	readonly name: string;
 	readonly params: ParamsData;
-	/** A remote contract's placement: the address of the host serving an object for its params. */
-	readonly placement: Placement | undefined;
+	/** A remote contract's host address: the address of the host serving an object for its params; none for local. */
+	readonly hostAddress: HostAddress | undefined;
 	/** Every version of the history, oldest first; the last is current. */
 	readonly versions: readonly VersionData[];
 	/** The kind of every member name ever declared in the history. */
@@ -107,8 +107,8 @@ export type ContractData = {
 
 export type MemberKind = "state" | "method" | "keyed";
 
-/** A placement as Chord calls it: with checked params. Plugin code: what it returns is checked where it is routed. */
-export type Placement = (params: ParamsOf<Contract>) => Address;
+/** A `hostAddress` as Chord calls it: with checked params. Plugin code: what it returns is checked where routed. */
+export type HostAddress = (params: ParamsOf<Contract>) => Address;
 
 export type VersionData = {
 	readonly version: number;
@@ -148,6 +148,12 @@ export function takesNoArgs(method: MethodData): boolean {
 /** The variants of a contract's current version; a local contract has the one variant `LOCAL`. */
 export function currentVariants(contract: Contract): ReadonlyMap<string, VariantData> {
 	return contractData(contract).versions.at(-1)!.variants;
+}
+
+/** The variants of version `version` of a contract's history (an older consumer's binding, Q10). */
+export function variantsAt(contract: Contract, version: number): ReadonlyMap<string, VariantData> {
+	// Callers name a version the provider binds (`binds`): its history has it.
+	return contractData(contract).versions.find((data) => data.version === version)!.variants;
 }
 
 /** A variant's names as links index them (2b): its state members and its methods, each sorted. */

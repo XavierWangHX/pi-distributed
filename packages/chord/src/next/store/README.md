@@ -52,6 +52,20 @@ const copy = await importStore(sqliteBackend(db), decodeJsonl(bytes), ctx);
   checks every part (a trust boundary) and applies the archive in one backend transaction; JSONL via `encodeJsonl` and
   `decodeJsonl`.
 
+## For adapters (`../index.ts`, marked internal)
+
+Durable's `StoreStorage` keeps its records in the store: `StoreOwnerTables` declares and prepares an owner's tables
+(claimed, `"<owner>:<table>"`), `OwnerTable` encodes rows at staging, writes them in a step (`put`, with a step-stamped
+column) and reads them through queries compiled once (`prepare`, `prepareFirst`, `prepareGet`, `reader`); the documents
+engine's writes (`insertDocument`, `writeContent`, `retireRecord`) and reads at a point (`findDocument`, `loadContent`,
+`listDocumentEntries`, …); `store.commitSeries` stores several commits in one backend transaction, one seq each, each
+commit's check (a throw refuses it and ends the series, the commits before it stored) before its writes; `store.batch`
+is the attached host's batch, in which an adapter publishes its commits; `store.mintId()` and `store.ids` are the one
+allocator (D3); `store.claims` holds what can collide; `store.readTransaction` reads several queries at one
+state. A step's own error is a refusal (the commit rejects with it, the store goes on); `refusalOf` classifies it for
+Chord's owners. `applyBatch(store, commits, ctx)` replays outbox commits (the sync layer's entry point): refused at its
+call and at its turn while an owner holds a claim or once the store diverged, and no claim is taken while it applies.
+
 ## For Chord's layers
 
 `ChordStore` (`store.ts`: `commit(staged, fence, ctx)`, `read(fn, ctx)` guarded as Durable's `GuardedStorage`,

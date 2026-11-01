@@ -43,7 +43,7 @@ describe("staging", () => {
 		changes.delete({ id: "e9" });
 		expect(staged).toHaveLength(3);
 		expect(
-			await store.read((executor) => executor.get(`SELECT count(*) AS n FROM "session:app.store:edits"`), context),
+			await store.read((executor) => executor.get(`SELECT count(*) AS n FROM "app.store:edits"`), context),
 		).toEqual({ n: 1 });
 	});
 });

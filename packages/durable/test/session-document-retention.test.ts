@@ -1,6 +1,5 @@
 // The Session's document cache is bounded by use: unattached documents leave it after the retention period and load
 // from Storage again; documents with a watch or a document state never leave it.
-import type { Context } from "@earendil-works/chord";
 import { fauxAssistantMessage, fauxText, fauxToolCall, Type } from "@earendil-works/pi-ai";
 import {
 	type ConversationId,
@@ -10,7 +9,6 @@ import {
 	type HarnessSettings,
 	type LiveState,
 	MemoryStorage,
-	type Seq,
 	type StorageWrite,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it, onTestFinished } from "vitest";
@@ -218,9 +216,9 @@ describe("document cache retention", () => {
 		const conversationId = await createConversation(session);
 		const writes: StorageWrite[][] = [];
 		const commit = storage.commit.bind(storage);
-		storage.commit = (batch: readonly StorageWrite[], adopt: (seq: Seq) => void, commitContext: Context) => {
-			writes.push([...batch]);
-			return commit(batch, adopt, commitContext);
+		storage.commit = (batches, receive, commitContext) => {
+			for (const batch of batches) writes.push([...batch]);
+			return commit(batches, receive, commitContext);
 		};
 		for (let n = 0; n < 5; n++) {
 			await bump(session, conversationId);

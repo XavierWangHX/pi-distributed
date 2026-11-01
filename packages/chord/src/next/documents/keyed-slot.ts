@@ -8,12 +8,20 @@ import { type Prepared, type Tracker, track } from "../../delta/index.ts";
 import type { Watch } from "../../watch.ts";
 import { ChordError } from "../data/index.ts";
 import { asChordError } from "../data/internal.ts";
+import type { StagedWrite } from "../store/step.ts";
 import { compareText, storedText } from "../store/text.ts";
 import { AddressSource } from "./address-source.ts";
 import type { JsonObject } from "./definition.ts";
 import type { Documents } from "./documents.ts";
 import type { SealToken } from "./fence.ts";
-import type { Loaded, Persistence, Stored } from "./persistence.ts";
+import {
+	type DocumentChange,
+	type Loaded,
+	type Persistence,
+	type Stored,
+	type StoredChange,
+	storedAfter,
+} from "./persistence.ts";
 import { Resident } from "./residency.ts";
 import { type AnyDefinition, type DocumentSlot, type PersistedSlot, SlotDefinition } from "./slot.ts";
 
@@ -222,6 +230,10 @@ export class KeyedSlot implements DocumentSlot, PersistedSlot {
 		return this.#residents.get(key)?.stored;
 	}
 
+	stage(key: string, change: DocumentChange, was: Stored | undefined, writes: StagedWrite[]): StoredChange {
+		return this.persistence.stage(key, this.definition.current, was, change, writes);
+	}
+
 	/**
 	 * Takes the attempt's declaration: a newer version migrates each document in memory on its next access (persisted
 	 * ones store a base with their next change); the pinned keys are watched, so they migrate now, all or none, and
@@ -251,7 +263,13 @@ export class KeyedSlot implements DocumentSlot, PersistedSlot {
 		return this.definition.current.initial(context);
 	}
 
-	adopt(key: string, tracker: Tracker<JsonObject>, prepared: Prepared<JsonObject>, stored: Stored | undefined): void {
+	adopt(
+		key: string,
+		tracker: Tracker<JsonObject>,
+		prepared: Prepared<JsonObject>,
+		change: StoredChange | undefined,
+	): void {
+		const stored = change === undefined ? undefined : storedAfter(change);
 		const source = this.#sources.get(key);
 		const before = source?.peek();
 		tracker.adopt(prepared);
@@ -364,7 +382,6 @@ export class KeyedSlot implements DocumentSlot, PersistedSlot {
  * document's value, `initial()` while it is absent; retirements arrive with the `retired` flag.
  */
 export class KeySource extends AddressSource {
-	readonly owner: Documents;
 	readonly #slot: KeyedSlot;
 	readonly key: string;
 	/** Its pins: at 0 the slot forgets it. */
@@ -375,7 +392,6 @@ export class KeySource extends AddressSource {
 
 	constructor(slot: KeyedSlot, key: string, initial: JsonObject, ready: boolean) {
 		super(slot.owner.batch);
-		this.owner = slot.owner;
 		this.#slot = slot;
 		this.key = key;
 		this.#initial = initial;

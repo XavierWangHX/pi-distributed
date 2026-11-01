@@ -13,8 +13,11 @@ export type VariantShape = {
 /** Variants by name. A local contract has the single variant `members`. */
 export type Variants = { readonly [variant: string]: VariantShape };
 
-/** What one edit changed: one side of one member in one variant (a union of variants when it changed several). */
-export type Change = readonly [variant: string, member: string, side: "state" | "args" | "result"];
+/**
+ * What one edit changed: one side of one member in one variant (a union of variants when it changed several); `keyed`
+ * for a local contract's keyed member (slice 7b).
+ */
+export type Change = readonly [variant: string, member: string, side: "state" | "args" | "result" | "keyed"];
 
 /** One version: its number as digits, its variants, and the changes that produced it (`never` for a base). */
 type Step = { readonly version: string; readonly variants: Variants; readonly changes: Change };

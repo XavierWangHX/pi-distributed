@@ -14,7 +14,6 @@ import {
 } from "@earendil-works/pi-ai";
 import {
 	type Conversation,
-	defineDoc,
 	defineTool,
 	type EntryRecord,
 	GenerationTask,
@@ -191,22 +190,20 @@ describe("inbox", () => {
 		await first.reached;
 		const f1 = await root.submit({ type: "input", content: "f1" }, context);
 		const f2 = await root.submit({ type: "input", content: "f2" }, context);
-		// Occupy the line, let the answer queue its boundary commit behind it, then change the mode.
-		const held = storage.holdCommits();
-		const Marker = defineDoc<{ n: number }>({
-			checkpointWhen: () => false,
-			kind: "test.marker",
-			version: 1,
-			scope: "session",
-			initial: () => ({ n: 0 }),
-		});
-		const occupying = root.commit(async (tx) => void (await tx.doc(Marker)).n++, context);
-		await held.entered;
+		// Occupy the line with a commit whose callback waits, let the answer queue its boundary commit behind it, then
+		// change the mode.
+		const entered = deferred();
+		const release = deferred();
+		const occupying = root.commit(async () => {
+			entered.resolve();
+			await release.promise;
+		}, context);
+		await entered.promise;
 		first.release();
 		await yielded.promise;
 		await flush();
 		setup.settings.followUpMode = "all";
-		held.release();
+		release.resolve();
 		await occupying;
 		const settled = await f2.wait(context);
 		expect(await status(f1)).toEqual({ ...settled, id: f1.id, entry: expect.any(Number) });
@@ -898,17 +895,17 @@ describe("inbox", () => {
 		let inboxId: number | undefined;
 		class RecordingStorage extends MemoryStorage {
 			override async commit(
-				writes: Parameters<MemoryStorage["commit"]>[0],
-				adopt: Parameters<MemoryStorage["commit"]>[1],
+				batches: Parameters<MemoryStorage["commit"]>[0],
+				receive: Parameters<MemoryStorage["commit"]>[1],
 				callContext: Parameters<MemoryStorage["commit"]>[2],
 			) {
-				for (const write of writes) {
+				for (const write of batches.flat()) {
 					if (write.type !== "document.change" || write.id !== inboxId) continue;
 					const content = write.content;
 					const empty = content.kind === "base" && (content.value as InboxState).items.length === 0;
 					written.push({ kind: content.kind, empty });
 				}
-				return super.commit(writes, adopt, callContext);
+				return super.commit(batches, receive, callContext);
 			}
 		}
 		const setup = chatSetup();

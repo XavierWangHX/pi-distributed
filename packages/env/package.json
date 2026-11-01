@@ -22,7 +22,7 @@
 		"CHANGELOG.md"
 	],
 	"scripts": {
-		"clean": "shx rm -rf dist",
+		"clean": "node ../../scripts/package-files.mjs clean dist",
 		"build": "tsc -p tsconfig.build.json",
 		"build:daemon": "cargo build --manifest-path daemon/Cargo.toml --locked",
 		"test": "vitest --run",
@@ -49,7 +49,6 @@
 		"@earendil-works/pi-durable": "1.4.0"
 	},
 	"devDependencies": {
-		"shx": "0.3.4",
 		"vitest": "4.1.12"
 	}
 }

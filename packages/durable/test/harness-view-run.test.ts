@@ -103,7 +103,12 @@ describe("a run as the conversation view shows it", () => {
 		expect(partialsIn(states).map(textOf)).toEqual(partials.map(textOf));
 		// The run shows from the input's commit until the commit that appends the answer and clears the partial.
 		const started = states.findIndex((state) => state.run !== undefined);
-		expect(states[started]!.run).toEqual({ taskId: expect.any(Number), inputs: [submission.id], turns: 0 });
+		expect(states[started]!.run).toEqual({
+			taskId: expect.any(Number),
+			inputs: [submission.id],
+			turns: 0,
+			first: expect.any(Number),
+		});
 		expect(history.views[started]!.entries.at(-1)!.kind).toBe("pi.user");
 		const ended = states.findIndex((state, index) => index > started && state.run === undefined);
 		expect(states[ended]!.generation).toBeUndefined();

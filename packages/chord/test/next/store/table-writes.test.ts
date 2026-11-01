@@ -26,7 +26,7 @@ const Edits = defineTable("edits", {
 	key: ["id"],
 	indexes: { by_path: ["path"] },
 });
-const TABLE = "session:app.store:edits";
+const TABLE = "app.store:edits";
 const FENCE = { admit: () => true, adopt: () => {} };
 
 let store: ChordStore;
@@ -71,10 +71,11 @@ describe("schema writes", () => {
 		expect(indexes).toContainEqual({ name: `${TABLE}:by_path` });
 	});
 
-	it("an index write for a table the store does not have fails the step (storage_failed)", async () => {
+	it("an index write for a table the store does not have refuses the step (D4: the store goes on)", async () => {
 		await opened();
-		const write = stageIndex({ kind: "index", table: "session:app.store:nope", name: "x", columns: ["id"] });
-		await expect(store.commit([write], FENCE, context)).rejects.toMatchObject({ reason: "storage_failed" });
+		const write = stageIndex({ kind: "index", table: "app.store:nope", name: "x", columns: ["id"] });
+		await expect(store.commit([write], FENCE, context)).rejects.toThrow("not in the store");
+		expect(await store.read(async () => 1, context)).toBe(1);
 	});
 });
 

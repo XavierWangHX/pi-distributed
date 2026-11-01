@@ -50,7 +50,7 @@ describe("round trips", () => {
 		const store = await imported(parts);
 		expect(await exported(store)).toEqual(parts);
 		const manifest = parts[0] as Extract<ArchivePart, { readonly kind: "manifest" }>;
-		expect([store.lastSeq, store.nextDocumentId]).toEqual([manifest.lastSeq, manifest.nextDocumentId]);
+		expect([store.lastSeq, store.nextId]).toEqual([manifest.lastSeq, manifest.nextId]);
 	});
 
 	it("the store keeps its ids, seqs and folded documents; the outbox, when asked, starts after lastSeq", async () => {
@@ -59,8 +59,7 @@ describe("round trips", () => {
 		expect(await store.outbox!.read(store.lastSeq, 10, context)).toEqual([]);
 		expect(await rejection(store.outbox!.read(0, 10, context))).toMatchObject({ code: "invalid" });
 		const record = await store.read(
-			(executor) =>
-				findDocument(executor, { namespace: "chord", owner: "client:app.store", kind: "memo", key: "a" }),
+			(executor) => findDocument(executor, { namespace: "chord", owner: "app.store", kind: "memo", key: "a" }),
 			context,
 		);
 		const original = parts.find((part) => part.kind === "document.create" && part.record.key === "a");
@@ -71,12 +70,12 @@ describe("round trips", () => {
 	it("a migrating table resumes on the imported store; rows written at version 1 read as the table's", async () => {
 		const store = await imported(await archive());
 		const { EditsV2, NotesV2 } = ArchiveTables;
-		const notes = "client:app.store:notes";
+		const notes = "app.store:notes";
 		const fence = { admit: () => true, adopt: () => {} };
 		await expect(
 			prepareTables([{ definition: NotesV2, table: notes }], store, fence, "app", context),
 		).rejects.toThrow("crash");
-		const edits = new TableHandle(EditsV2, "client:app.store:edits", store, tableOwner());
+		const edits = new TableHandle(EditsV2, "app.store:edits", store, tableOwner());
 		expect(await edits.get({ id: "e003" }, context)).toEqual({
 			id: "e003",
 			path: "p/3",
@@ -163,8 +162,18 @@ interface Mutable {
 }
 
 /** Part `index` as a writable object. */
+/** The positions of every part of `kind`. */
+function all(parts: readonly ArchivePart[], kind: ArchivePart["kind"]): number[] {
+	return parts.flatMap((part, index) => (part.kind === kind ? [index] : []));
+}
+
 function at(parts: unknown[], index: number): Mutable {
 	return parts[index] as Mutable;
+}
+
+/** The content of the revision part at `index`, writable. */
+function revisionContent(parts: unknown[], index: number): Mutable {
+	return at(parts, index).content as Mutable;
 }
 
 describe("refusals", () => {
@@ -258,12 +267,12 @@ describe("refusals", () => {
 			"tables come before the documents",
 		],
 		[
-			"a table name that is not kind:type:table",
+			"a table name that is not owner:table",
 			(parts) => {
 				at(parts, first(parts, "table")).table = "edits";
 				return parts;
 			},
-			"not kind:type:table",
+			"not owner:table",
 		],
 		[
 			"a column name breaking the rules",
@@ -325,8 +334,8 @@ describe("refusals", () => {
 		[
 			"an id twice",
 			(parts) => {
-				const document = first(parts, "document.create");
-				(at(parts, document + 1).record as Mutable).id = (at(parts, document).record as Mutable).id!;
+				const [one, two] = all(parts, "document.create");
+				(at(parts, two!).record as Mutable).id = (at(parts, one!).record as Mutable).id!;
 				return parts;
 			},
 			"occurs twice",
@@ -337,24 +346,75 @@ describe("refusals", () => {
 				(at(parts, first(parts, "document.create")).record as Mutable).createdAt = 10_000;
 				return parts;
 			},
-			"created after the manifest's lastSeq",
+			"a lifetime outside the manifest's lastSeq",
 		],
 		[
-			"a base at another version",
+			"a base at another version than its record's",
 			(parts) => {
-				(at(parts, first(parts, "document.create")).base as Mutable).version = 2;
+				revisionContent(parts, first(parts, "document.revision")).version = 2;
 				return parts;
 			},
-			"the base is not at the record's version",
+			"has no base at its version",
+		],
+		[
+			"a delta without a base at its version",
+			(parts) => {
+				const delta = parts.findIndex((part) => part.kind === "document.revision" && part.content.kind === "delta");
+				revisionContent(parts, delta).version = 2;
+				return parts;
+			},
+			"a delta without a base at its version",
+		],
+		[
+			"a revision out of seq order",
+			(parts) => {
+				const delta = parts.findIndex((part) => part.kind === "document.revision" && part.content.kind === "delta");
+				at(parts, delta).seq = 1;
+				return parts;
+			},
+			"out of seq order",
+		],
+		[
+			"a revision of another record",
+			(parts) => {
+				at(parts, first(parts, "document.revision")).id = 9_999;
+				return parts;
+			},
+			"follows its record's create",
+		],
+		[
+			"a live record without revisions",
+			(parts) => parts.filter((_, index) => index !== first(parts, "document.revision")),
+			"has no base at its version",
+		],
+		[
+			"revisions of a retired none record",
+			(parts) => {
+				const record = at(parts, first(parts, "document.create")).record as Mutable;
+				record.retiredAt = record.createdAt!;
+				return parts;
+			},
+			"keeps no revisions",
+		],
+		[
+			"a retired rewindable record without its history",
+			(parts) => {
+				const record = at(parts, first(parts, "document.create")).record as Mutable;
+				record.history = "rewindable";
+				record.retiredAt = record.createdAt!;
+				const id = record.id;
+				return parts.filter((part) => part.kind !== "document.revision" || part.id !== id);
+			},
+			"has no base at its version",
 		],
 		[
 			"two live records at one address",
 			(parts) => {
-				const document = first(parts, "document.create");
-				(at(parts, document + 1).record as Mutable).key = (at(parts, document).record as Mutable).key!;
+				const [one, two] = all(parts, "document.create");
+				(at(parts, two!).record as Mutable).key = (at(parts, one!).record as Mutable).key!;
 				return parts;
 			},
-			"a second live record at one address",
+			"a second record at one address for an overlapping lifetime",
 		],
 		[
 			"a record's meta with a NUL",

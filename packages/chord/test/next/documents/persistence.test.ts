@@ -27,7 +27,7 @@ let notes: Persistence;
 
 beforeEach(async () => {
 	store = await memoryStore({ outbox: true });
-	notes = new Persistence(store, "session:app.store", "notes.note");
+	notes = new Persistence(store, "app.store", "chord", "notes.note");
 });
 
 afterEach(async () => {
@@ -47,20 +47,10 @@ async function change(
 	after(draft.state);
 	const prepared = draft.prepare();
 	const writes: StagedWrite[] = [];
-	const result = notes.stage(key, definition, stored, { prepared, retires: false }, writes, 0);
-	let ids: readonly number[] = [];
-	await store.commit(
-		writes,
-		{
-			admit: () => true,
-			adopt: (_seq, created) => {
-				ids = created;
-			},
-		},
-		context,
-	);
+	const result = notes.stage(key, definition, stored, { prepared, retires: false }, writes);
+	await store.commit(writes, { admit: () => true, adopt: () => {} }, context);
 	tracker.adopt(prepared);
-	return storedAfter(result, ids);
+	return storedAfter(result);
 }
 
 /** The document at `key` read from the store and decoded by `definition`, `undefined` when absent. */
@@ -177,7 +167,10 @@ describe("loads", () => {
 				},
 				undefined,
 			);
-		expect(await notes.find("a", context)).toMatchObject({ revision: 1, version: 1 });
+		expect(await notes.find("a", context)).toMatchObject({
+			stored: { revision: 1, version: 1 },
+			fingerprint: expect.any(String),
+		});
 		expect(await notes.keys(undefined, 10, context)).toEqual(["a", "b", "\uFFFF", "\u{1F600}"]);
 		expect(await notes.keys("b", 1, context)).toEqual(["\uFFFF"]);
 	});
@@ -259,12 +252,12 @@ describe("staged writes", () => {
 			draft.state.n = n;
 			return draft.prepare();
 		};
-		const first = notes.stage("b", Note, undefined, { prepared: fresh(2), retires: false }, writes, 0);
-		const again = notes.stage("a", Note, stored, { prepared: fresh(3), retires: true }, writes, 1);
-		const gone = notes.stage("c", Note, undefined, { prepared: undefined, retires: true }, writes, 2);
-		expect([first, again, gone]).toEqual([
-			{ kind: "create", version: 1, index: 0 },
-			{ kind: "create", version: 1, index: 1 },
+		const first = notes.stage("b", Note, undefined, { prepared: fresh(2), retires: false }, writes);
+		const again = notes.stage("a", Note, stored, { prepared: fresh(3), retires: true }, writes);
+		const gone = notes.stage("c", Note, undefined, { prepared: undefined, retires: true }, writes);
+		expect([first, again, gone]).toMatchObject([
+			{ kind: "create", version: 1 },
+			{ kind: "create", version: 1 },
 			{ kind: "retire" },
 		]);
 		let ids: readonly number[] = [];
@@ -279,7 +272,7 @@ describe("staged writes", () => {
 			context,
 		);
 		expect(ids).toEqual([stored!.id + 1, stored!.id + 2]);
-		expect(storedAfter(again, ids)).toEqual({ id: stored!.id + 2, revision: 1, version: 1, deltasSinceBase: 0 });
+		expect(storedAfter(again)).toEqual({ id: stored!.id + 2, revision: 1, version: 1, deltasSinceBase: 0 });
 		expect((await outboxKinds()).at(-1)).toEqual(["document.retire", "document.create", "document.create"]);
 	});
 
@@ -287,6 +280,6 @@ describe("staged writes", () => {
 		// Drafts refuse such values when placed; a prepared change made by hand shows where the text is made.
 		const value = { title: "", n: 1n } as unknown as JsonObject;
 		const prepared = { base: value, value, ops: [], baseRevision: 0, abort: () => {} };
-		expect(() => notes.stage("a", Note, undefined, { prepared, retires: false }, [], 0)).toThrow(TypeError);
+		expect(() => notes.stage("a", Note, undefined, { prepared, retires: false }, [])).toThrow(TypeError);
 	});
 });

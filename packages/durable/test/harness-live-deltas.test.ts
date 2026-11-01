@@ -131,37 +131,39 @@ describe("pi.live deltas", () => {
 		const result = entries.items.find((entry) => entry.kind === "pi.tool-result")!.id;
 		expect(commits).toEqual([
 			// submission
-			[["s", ["run"], { taskId: firstGeneration, inputs: [expect.any(Number)], turns: 0 }]],
-			// request
-			[["s", ["generation"], { attempt: 1 }]],
-			// the generation starts its tool round and keeps the run, counting the round as one turn (#11043)
-			expect.arrayContaining([
-				["d", ["generation"]],
+			[
+				[
+					"s",
+					["run"],
+					{ taskId: firstGeneration, inputs: [expect.any(Number)], turns: 0, first: expect.any(Number) },
+				],
+			],
+			// the generation starts its tool round and keeps the run, counting the round as one turn (#11043); the request's
+			// attempt is deferred, so it is stored here, its held operation first
+			[
+				["s", ["generation"], { attempt: 1 }],
 				["s", ["tools"], [{ callId: "c1", name: "noop", taskId: tool, status: "pending" }]],
+				["d", ["generation"]],
 				["s", ["run", "turns"], 1],
-			]),
-			// intent
-			[["s", ["tools", 0, "status"], "running"]],
-			// result
-			expect.arrayContaining([
+			],
+			// result: the running status is deferred like progress, so it is stored with the result, folded into its write
+			[
 				["s", ["tools", 0, "status"], "done"],
 				["s", ["tools", 0, "entry"], result],
-			]),
+			],
 			// the generation's tools phase hands the run to the next generation
 			expect.arrayContaining([
 				["d", ["tools"]],
 				["s", ["run", "taskId"], secondGeneration],
 			]),
-			[["s", ["generation"], { attempt: 1 }]],
-			// the answer ends the run
-			expect.arrayContaining([
+			// the answer ends the run, with the second request's deferred attempt first
+			[
+				["s", ["generation"], { attempt: 1 }],
 				["d", ["run"]],
 				["d", ["generation"]],
-			]),
+			],
 		]);
-		expect(commits[2]).toHaveLength(3);
-		expect(commits[4]).toHaveLength(2);
-		expect(commits[5]).toHaveLength(2);
+		expect(commits[3]).toHaveLength(2);
 		await harness.close(context);
 	});
 
@@ -286,17 +288,26 @@ describe("pi.live deltas", () => {
 		let liveId: number | undefined;
 		class RecordingStorage extends MemoryStorage {
 			override async commit(
-				writes: Parameters<MemoryStorage["commit"]>[0],
-				adopt: Parameters<MemoryStorage["commit"]>[1],
+				batches: Parameters<MemoryStorage["commit"]>[0],
+				receive: Parameters<MemoryStorage["commit"]>[1],
 				context: Parameters<MemoryStorage["commit"]>[2],
 			) {
-				let kind: "base" | "delta" | undefined;
-				for (const write of writes) {
-					if (write.type === "document.change" && write.id === liveId) kind = write.content.kind;
-				}
-				const seq = await super.commit(writes, adopt, context);
-				if (kind !== undefined) written.set(seq, kind);
-				return seq;
+				const kinds = batches.map((writes) => {
+					let kind: "base" | "delta" | undefined;
+					for (const write of writes) {
+						if (write.type === "document.change" && write.id === liveId) kind = write.content.kind;
+					}
+					return kind;
+				});
+				return super.commit(
+					batches,
+					(index, seq) => {
+						const kind = kinds[index];
+						if (kind !== undefined) written.set(seq, kind);
+						receive(index, seq);
+					},
+					context,
+				);
 			}
 		}
 		const setup = chatSetup();
@@ -323,6 +334,8 @@ describe("pi.live deltas", () => {
 			fauxAssistantMessage([fauxText("done")]),
 		]);
 		setup.settings.toolExecution = "sequential";
+		// Store deferred progress within each tool's run, so running slots reach Storage as deltas.
+		setup.settings.progress = { persistWithinMs: 50 };
 		const { harness, root } = await openChat(new RecordingStorage(), setup);
 		const values = new Map<number, LiveState>();
 		harness.observeCommits({

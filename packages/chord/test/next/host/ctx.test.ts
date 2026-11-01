@@ -5,7 +5,16 @@ import { withLinkedAbortSignal } from "../../../src/next/host/ctx.ts";
 import type { ChordHost } from "../../../src/next/host/host.ts";
 import type { Ctx, Host, Reference } from "../../../src/next/host/index.ts";
 import { constant } from "../../../src/next/state/index.ts";
-import { flushed, loaded, rawParent, rejection, type TestPrincipal } from "../support.ts";
+import {
+	flushed,
+	incarnationOf,
+	linked,
+	loaded,
+	rawParent,
+	rejection,
+	Server,
+	type TestPrincipal,
+} from "../support.ts";
 
 const Item = local("app.item", { version: 1, params: { id: int() }, members: { id: int() } });
 const Desk = local("app.desk", {
@@ -61,7 +70,7 @@ describe("ctx", () => {
 		expect(await rejection(seen.ctx!.get(Item, { id: 1 }))).toEqual({
 			code: "released",
 			reason: "settled",
-			message: "app.item: ctx.get after its handler settled",
+			message: "app.item: ctx.get after its call settled",
 		});
 	});
 
@@ -103,7 +112,7 @@ describe("ctx", () => {
 		expect(await seen.late).toMatchObject({
 			code: "released",
 			reason: "settled",
-			message: "app.item: ctx.get after its handler settled",
+			message: "app.item: ctx.get after its call settled",
 		});
 		await flushed();
 		// The late reference's object ended with it.
@@ -111,7 +120,12 @@ describe("ctx", () => {
 	});
 
 	it("a ctx.get still waiting when its handler settles gives up: its reference is released at once", async () => {
-		const Far = remote("app.far", { version: 1, params: {}, variants: { v: { state: { n: int() } } } });
+		const Far = remote("app.far", {
+			version: 1,
+			params: {},
+			hostAddress: () => Server(),
+			variants: { v: { state: { n: int() } } },
+		});
 		const Starter = local("app.starter", { version: 1, params: {}, members: { start: method() } });
 		let pending: Promise<unknown> | undefined;
 		const { host } = await loaded((h) =>
@@ -130,13 +144,40 @@ describe("ctx", () => {
 		expect(await pending).toMatchObject({
 			code: "released",
 			reason: "settled",
-			message: "app.far: ctx.get after its handler settled",
+			message: "app.far: ctx.get after its call settled",
 		});
 	});
 
 	it("a local handler's ctx.principal is the host's, its incarnation this host's", async () => {
 		const { desk: ref, host } = await desk();
 		expect(await ref.who(context)).toBe(`none ${(host as ChordHost).incarnation}`);
+	});
+});
+
+describe("local handlers act as the host (§4, audit)", () => {
+	it("a local object called from a remote handler's ctx.get runs with this host's principal and incarnation", async () => {
+		const Store = local("app.local-store", { version: 1, params: {}, members: { who: method(undefined, str()) } });
+		const Gate = remote("app.gate", {
+			version: 1,
+			params: {},
+			hostAddress: () => Server(),
+			variants: { v: { methods: { who: method(undefined, str()), through: method(undefined, str()) } } },
+		});
+		const who = (ctx: Ctx<TestPrincipal>) => `${ctx.principal?.kind ?? "none"} ${ctx.incarnation}`;
+		const { server, client } = await linked((h) => {
+			h.serve(Store, () => ({ who: async (ctx) => who(ctx) }));
+			h.serve(Gate, () => ({
+				variant: "v",
+				members: {
+					who: async (ctx) => who(ctx),
+					through: async (ctx) => (await ctx.get(Store, {})).who(ctx),
+				},
+			}));
+		});
+		const gate = await client.get(Gate, {}, context);
+		// The remote handler acts as its caller; the local object it reaches acts as this host, both halves.
+		expect(await gate.who(context)).toBe(`owner ${incarnationOf(client)}`);
+		expect(await gate.through(context)).toBe(`server ${incarnationOf(server)}`);
 	});
 });
 

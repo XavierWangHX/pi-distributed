@@ -5,11 +5,12 @@ import { bool, int, local, oneOf, remote, str } from "../../../src/next/contract
 import { isChordError } from "../../../src/next/data/index.ts";
 import { checkParams, identityKey } from "../../../src/next/data/internal.ts";
 import { validatorFor } from "../../../src/next/data/validator.ts";
-import { counted, expectCollected } from "../support.ts";
+import { counted, expectCollected, Server } from "../support.ts";
 
 const Session = remote("session", {
 	version: 1,
 	params: { id: str({ min: 1 }), mode: oneOf("chat", "agent"), page: int({ min: 0 }), open: bool() },
+	hostAddress: () => Server(),
 	variants: { owner: {} },
 });
 

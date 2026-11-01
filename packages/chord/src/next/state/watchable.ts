@@ -7,7 +7,7 @@ import { Watch, type Watchable, type WatchCall, type WatchEnd } from "../../watc
 import type { Batch } from "./batch.ts";
 
 /**
- * A synchronous subscriber of a source (a hold over a link, a member source): fed the source's call inside the batch
+ * A synchronous subscriber of a source (a hold over a link, a reference's member): fed the source's call inside the batch
  * that made it, before the batch ends, so everything one commit changed can leave in one message. The watch's own sink
  * shape (`Watch.advance`, `Watch.end`).
  */
@@ -20,6 +20,11 @@ export interface Subscriber {
 	advance(call: WatchCall<JsonValue>, context: Context): void;
 	/** The source ended for good with `end`; nothing follows, and the subscriber is dropped. */
 	end(end: WatchEnd): void;
+	/**
+	 * The source ended for good after its last call (a followed runtime ended): a subscriber delivering later (a watch)
+	 * ends `ended` once it delivered what it was given, others end now.
+	 */
+	endAfterDelivery(): void;
 }
 
 /**
@@ -40,7 +45,7 @@ export function handedOut<E>(error: E): E {
 }
 
 /**
- * What reads a source and is marked by its changes: a derive, or a member source forwarding to derives (`Source.
+ * What reads a source and is marked by its changes: a derive, or a reference's member forwarding to derives (`Source.
  * dependents`).
  */
 export interface Dependent {
@@ -57,11 +62,12 @@ const ENDED: WatchEnd = { kind: "ended" };
  * per batch that changed it, and the derives reading it are marked dirty when it changes.
  */
 export abstract class Source implements Watchable<JsonValue> {
-	/** Derives reading this source (and member sources forwarding to some); each removes itself when it stops. */
+	/** Derives reading this source (and references' members forwarding to some); each removes itself when it stops. */
 	readonly dependents = new Set<Dependent>();
 	protected readonly batch: Batch;
-	readonly #watches = new Set<Watch<JsonValue>>();
-	readonly #subscribers = new Set<Subscriber>();
+	/** Its watches and subscribers, each made by its first: most sources (a reference's members) never have one. */
+	#watches: Set<Watch<JsonValue>> | undefined;
+	#subscribers: Set<Subscriber> | undefined;
 
 	constructor(batch: Batch) {
 		this.batch = batch;
@@ -71,7 +77,7 @@ export abstract class Source implements Watchable<JsonValue> {
 
 	/** Whether a watch or a subscriber follows this source. */
 	get watched(): boolean {
-		return this.#watches.size > 0 || this.#subscribers.size > 0;
+		return (this.#watches?.size ?? 0) > 0 || (this.#subscribers?.size ?? 0) > 0;
 	}
 
 	async watch(context: Context): Promise<Watch<JsonValue>> {
@@ -88,8 +94,10 @@ export abstract class Source implements Watchable<JsonValue> {
 		const start = this.start();
 		if (start.kind === "failed" && start.last === undefined) throw start.error;
 		const value = start.kind === "value" ? start.value : start.last!;
-		const watch: Watch<JsonValue> = new Watch(value, () => this.#watches.delete(watch), this.batch.reportListener);
-		this.#watches.add(watch);
+		this.#watches ??= new Set();
+		const watches = this.#watches;
+		const watch: Watch<JsonValue> = new Watch(value, () => watches.delete(watch), this.batch.reportListener);
+		watches.add(watch);
 		if (context.abortSignal !== undefined) watch.observeAbort(context.abortSignal);
 		if (start.kind === "failed") watch.fail(start.error, context);
 		return watch;
@@ -102,11 +110,12 @@ export abstract class Source implements Watchable<JsonValue> {
 
 	/** Feeds `subscriber` every frame from now on, inside each batch; the caller took the current value first. */
 	subscribe(subscriber: Subscriber): void {
+		this.#subscribers ??= new Set();
 		this.#subscribers.add(subscriber);
 	}
 
 	unsubscribe(subscriber: Subscriber): void {
-		this.#subscribers.delete(subscriber);
+		this.#subscribers?.delete(subscriber);
 	}
 
 	/** Delivers this batch's frame to its watches; called once per batch that listed it with `changed`. */
@@ -133,10 +142,11 @@ export abstract class Source implements Watchable<JsonValue> {
 		this.forward({ kind: "value", value, ops, retired }, context);
 	}
 
-	/** Queues `call` on every watch and feeds it to every subscriber, as it is (a member source passes one on). */
+	/** Queues `call` on every watch and feeds it to every subscriber, as it is (a reference's member passes one on). */
 	protected forward(call: WatchCall<JsonValue>, context: Context): void {
-		for (const watch of this.#watches) watch.advance(call, context);
-		for (const subscriber of this.#subscribers) subscriber.advance(call, context);
+		if (this.#watches !== undefined) for (const watch of this.#watches) watch.advance(call, context);
+		if (this.#subscribers !== undefined)
+			for (const subscriber of this.#subscribers) subscriber.advance(call, context);
 	}
 
 	/**
@@ -147,11 +157,23 @@ export abstract class Source implements Watchable<JsonValue> {
 		this.forward({ kind: "failed", error: handedOut(error) }, context);
 	}
 
+	/**
+	 * Ends every watch and subscriber for good once what they were given is delivered (a followed runtime ended after a
+	 * last call, Durable's `endAfterDelivery`): `ended`; nothing follows.
+	 */
+	protected endWatchesAfterDelivery(): void {
+		if (this.#watches !== undefined) for (const watch of [...this.#watches]) watch.endAfterDelivery();
+		if (this.#subscribers === undefined || this.#subscribers.size === 0) return;
+		const subscribers = [...this.#subscribers];
+		this.#subscribers.clear();
+		for (const subscriber of subscribers) subscriber.endAfterDelivery();
+	}
+
 	/** Ends every watch and subscriber for good (its owner ended): `ended`; nothing follows. */
 	protected endWatches(): void {
 		// Ending detaches, which deletes the current entry (safe while iterating) and runs no listener.
-		for (const watch of this.#watches) watch.end(ENDED);
-		if (this.#subscribers.size === 0) return;
+		if (this.#watches !== undefined) for (const watch of this.#watches) watch.end(ENDED);
+		if (this.#subscribers === undefined || this.#subscribers.size === 0) return;
 		// A copy: a subscriber may unsubscribe as it ends.
 		const subscribers = [...this.#subscribers];
 		this.#subscribers.clear();

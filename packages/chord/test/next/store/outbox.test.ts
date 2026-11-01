@@ -14,13 +14,13 @@ import { type ChordStore, openStore } from "../../../src/next/store/store.ts";
 import { openNodeSqliteDatabase } from "../../../src/sqlite/node.ts";
 import { memoryStore, rejection } from "../support.ts";
 
-const ADDRESS = { namespace: "chord", owner: "session:app.store", kind: "notes", key: "" };
+const ADDRESS = { namespace: "chord", owner: "app.store", kind: "notes", key: "" };
 const BASE = { version: 1, fingerprint: "0000000000000000", value: { n: 0 } };
 const OPEN = { admit: () => true, adopt: () => {} };
 
 /** Creates the singleton at `ADDRESS` (with `key`) in one commit. */
 async function created(store: ChordStore, key = ""): Promise<void> {
-	await store.commit([createDocument({ ...ADDRESS, key }, "latest", BASE, JSON.stringify(BASE.value))], OPEN, context);
+	await store.commit([createDocument({ ...ADDRESS, key }, BASE, JSON.stringify(BASE.value))], OPEN, context);
 }
 
 let directory: string | undefined;
@@ -46,7 +46,7 @@ describe("the outbox", () => {
 		await store.close(context);
 		store = await open(true);
 		expect(store.outbox?.floor).toBe(1);
-		const id = 1;
+		const id = 2;
 		const ops = [["s", ["n"], 2]] as const;
 		await store.commit(
 			[changeDocument(id, 1, { kind: "delta", version: 1, ops }, JSON.stringify(ops))],
@@ -58,6 +58,7 @@ describe("the outbox", () => {
 		expect(await store.outbox!.read(1, 10, context)).toEqual([
 			{
 				seq: 2,
+				nextId: 3,
 				writes: [{ kind: "document.change", id, revision: 1, content: { kind: "delta", version: 1, ops } }],
 			},
 		]);
@@ -75,7 +76,7 @@ describe("the outbox", () => {
 		const [commit] = await store.outbox!.read(0, 10, context);
 		expect(commit!.writes[0]).toMatchObject({
 			kind: "document.create",
-			record: { id: 1, createdAt: 1, ...ADDRESS },
+			record: { id: 2, createdAt: 1, ...ADDRESS },
 			base: BASE,
 		});
 		await store.outbox!.trim(1, context);

@@ -31,6 +31,7 @@ import {
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { commitWrites } from "../src/testing/commit-writes.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, waitFor } from "./chat-support.ts";
 import { addHooks, addTool } from "./harness-support.ts";
 import { context } from "./session-support.ts";
@@ -763,7 +764,7 @@ describe("calls to tools the request did not offer", () => {
 			if (version === 1) {
 				const storage = await openNodeSqliteStorage(path);
 				const record = (await storage.task(generation, context))!;
-				await storage.commit([{ type: "task", value: { ...record, version: 1 } }], () => {}, context);
+				await commitWrites(storage, [{ type: "task", value: { ...record, version: 1 } }], context);
 				await storage.close(context);
 			}
 

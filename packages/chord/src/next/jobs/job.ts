@@ -7,13 +7,13 @@ import type { Draft } from "../../delta/index.ts";
 import type { JsonValue } from "../../json.ts";
 import type { Watchable } from "../../watch.ts";
 import { ChordError, isChordError, PluginError, type Principal } from "../data/index.ts";
-import type { JsonObject, Tx } from "../documents/index.ts";
+import type { CommitPersistence, JsonObject, Tx } from "../documents/index.ts";
 import type { Documents, SealToken, Transaction } from "../documents/internal.ts";
 import { type Ctx, sleep } from "../host/index.ts";
 import { type AnyHost, CallContext, type Caller, nextDelay } from "../host/internal.ts";
-import type { Outcome } from "./definition.ts";
+import type { JobDefinition, Outcome } from "./definition.ts";
 import type { JobRecords, Settled } from "./records.ts";
-import type { AnyOutcome, JobRun, Run } from "./run.ts";
+import type { AnyOutcome, Invocation, JobRun, Run } from "./run.ts";
 import type { RunningEntry } from "./running.ts";
 
 /** A job's handle, `self.job(Job, { run, finish? })`; `A`, `R` and `S` are its args, result and state. */
@@ -27,10 +27,12 @@ export interface JobHandle<A, R, S> {
 	/** Waits for the outcome of the unsettled run `id`; a settled or unknown id rejects `gone`. */
 	outcome(id: string, context: Context): Promise<Outcome<A, R, S>>;
 	/**
-	 * Fires a running run's abort signal; drops a blocked run (no `finish`; its waiters reject `aborted`); ignored for
-	 * finishing runs and unknown ids.
+	 * Aborts run `id` (D7, as Durable's `abortTask`): marks it (stored for a persisted job) and fires its `run`'s
+	 * signal, resolving `"marked"` once its `run` settled (a run not invoked yet ends `aborted` without one); a
+	 * finishing run is only marked, a blocked one dropped (no `finish`; its waiters reject `aborted`). `"terminal"` when
+	 * no unsettled run has that id. `context` ends only this wait.
 	 */
-	abort(id: string): void;
+	abort(id: string, context: Context): Promise<"marked" | "terminal">;
 	/** The unsettled runs, one entry each in start order, tagged by phase (a JSON watchable, a state member). */
 	readonly running: Watchable<readonly RunningEntry<A, S>[]>;
 }
@@ -60,9 +62,15 @@ export interface RunState<S> {
 	readonly value: S;
 	/**
 	 * One transaction on the object's line drafting only this document, under `context` without its abort signal:
-	 * admitted while `run` runs (also after an abort, with the run's own ctx), refused `released` once it settled.
+	 * admitted while `run` runs (also after an abort, with the run's own ctx), refused `released` once it settled. A
+	 * persisted job's change may be `deferred` (D8): adopted and published at once, stored within `withinMs` (1,000 ms by
+	 * default) or earlier; a crash loses it. In memory the option changes nothing.
 	 */
-	change<T>(fn: (draft: Draft<S>) => T, context: Context): Promise<T>;
+	change<T>(
+		fn: (draft: Draft<S>) => T,
+		context: Context,
+		options?: { readonly persistence?: CommitPersistence },
+	): Promise<T>;
 }
 
 /** Where a job's handle runs its work: its attempt, as the job sees it. */
@@ -78,11 +86,19 @@ export type JobOwner = {
 	readonly token: SealToken;
 	readonly documents: Documents;
 	/**
-	 * Adds running work (an invocation and its finish, a deferred finish) to the attempt's drain; `cleanup` (its
-	 * bookkeeping) runs once, when it settles or when the attempt ends with it still running.
+	 * Adds running work (a finish, a reservation) to the attempt's calls drain; `cleanup` (its bookkeeping) runs once,
+	 * when it settles or when the attempt ends with it still running.
 	 */
 	admit(running: Promise<unknown>, cleanup?: () => void): void;
+	/** Adds a run's invocation to the attempt's drain at its end (a swap does not wait for it), as `admit`. */
+	admitRun(running: Promise<unknown>, cleanup: () => void): void;
 };
+
+/**
+ * Why a seal cuts a running in-memory run off: `restart` (its attempt ended while the object continues) or `reload`
+ * (a native restart, slice 7b §8); its outcome is `failed { aborted }` with that reason.
+ */
+export type CutReason = "restart" | "reload";
 
 /** A job's implementation as Chord calls it, whatever the job's types. */
 export type AnyJobImplementation = {
@@ -99,17 +115,26 @@ const FINISH_ATTEMPTS = 5;
  */
 export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined> {
 	readonly #records: JobRecords;
+	/** The definition its attempt declared: its invocations get args in its version, whatever the records' is now. */
+	readonly #definition: JobDefinition<unknown, unknown, unknown>;
 	readonly #implementation: AnyJobImplementation;
 	readonly #owner: JobOwner;
-	/** `declared` until the attempt is live (starts are refused), `sealed` once it is sealed. */
-	#state: "declared" | "live" | "sealed" = "declared";
+	/**
+	 * `declared` until the attempt is live (starts are refused), `handed` once a reload's swap gave its records to the
+	 * new attempt's job (starts refused, its invocations finish here), `sealed` once it is sealed.
+	 */
+	#state: "declared" | "live" | "handed" | "sealed" = "declared";
 	/** Runs whose `run` runs on this attempt. */
 	readonly #invocations = new Set<JobRun>();
+	/** The seal's error and cut reason, once sealed: a reservation committing after it cuts its run off with them. */
+	#sealed: { readonly error: ChordError; readonly reason: CutReason } | undefined;
 	/** Runs whose finish runs on this attempt. */
 	readonly #finishing = new Set<JobRun>();
 
 	constructor(records: JobRecords, implementation: AnyJobImplementation, owner: JobOwner) {
 		this.#records = records;
+		// Its attempt's declaration redefined the records just before (`ChordObject.jobRecords`).
+		this.#definition = records.definition;
 		this.#implementation = implementation;
 		this.#owner = owner;
 	}
@@ -128,8 +153,18 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 		return this.#records.outcome(id, context);
 	}
 
-	abort(id: string): void {
-		this.#records.abort(id);
+	abort(id: string, context: Context): Promise<"marked" | "terminal"> {
+		return this.#records.abort(id, context);
+	}
+
+	/** A persisted job's runs, loaded once per object at its first activation (before it goes live). */
+	load(context: Context): Promise<void> {
+		return this.#records.load(context);
+	}
+
+	/** The close writer of this job's runs, after the attempt's drain (slice 6b §4.2). */
+	writeAtClose(context: Context): Promise<void> {
+		return this.#records.writeAtClose(context);
 	}
 
 	/** The attempt went live: starts are taken, and the records' waiting runs are invoked or finished here. */
@@ -150,7 +185,7 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 		if (tx.documents !== this.#owner.documents) {
 			throw new Error(`${this.#owner.documents.label}: a transaction starts only its own object's jobs`);
 		}
-		if (this.#state === "sealed") {
+		if (this.#state === "sealed" || this.#state === "handed") {
 			throw new ChordError({
 				code: "released",
 				reason: "ended",
@@ -164,43 +199,100 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 	}
 
 	/**
-	 * The attempt is sealed with `error`: starts are refused, running invocations are cut off (their signals fire, they
-	 * end `aborted` with reason `restart` and finish on the next live attempt), and the runs finishing here wait for it.
+	 * The attempt is sealed with `error`: starts are refused, running invocations are cut off (their signals fire, in
+	 * memory they end `aborted` with `reason` and finish on the next live attempt, persisted ones are stopped and
+	 * resumed, R3), and the runs finishing here wait for it.
 	 */
-	seal(error: ChordError): void {
+	seal(error: ChordError, reason: CutReason): void {
 		if (this.#state === "sealed") return;
+		const handed = this.#state === "handed";
 		this.#state = "sealed";
+		this.#sealed = { error, reason };
 		this.#records.detach(this, this.#finishing);
 		this.#finishing.clear();
-		for (const run of this.#invocations) this.#records.cut(run, error);
+		// A handed-over job's invocations finish on its code; their outcomes go to the new attempt's job.
+		if (!handed) for (const run of this.#invocations) this.#records.cut(run, error, reason);
 		this.#invocations.clear();
 	}
 
 	/**
-	 * Runs `run` for a committed run (with its signal aborted already after an early abort). The invocation and the
+	 * A reload swapped its attempt out (slice 7b §8): starts are refused, the records go to the new attempt's job once it
+	 * is live, the runs it invokes finish on this code (their outcome is finished by the new code), a finish running here
+	 * completes here.
+	 */
+	handOver(): void {
+		if (this.#state !== "live" && this.#state !== "declared") return;
+		this.#state = "handed";
+		// Runs needing a live attempt meanwhile wait for the new one.
+		this.#records.detach(this, []);
+	}
+
+	/**
+	 * Runs `run` for a committed run (with its signal aborted already after an early abort); a persisted run's
+	 * reservation commits first (`running`: a crash from then on counts, D6). The reservation, the invocation and the
 	 * run's finish are one piece of work in the drain, admitted before plugin code runs: `run` may end its own object
 	 * before its first await.
 	 */
 	invoke(run: JobRun): void {
+		const invocation = run.begin();
+		if (!this.#records.persisted || run.phase === "running") {
+			this.#start(run, invocation);
+			return;
+		}
+		const { documents, token, context } = this.#owner;
+		const reserving = documents
+			.tx((tx) => this.#records.reserve(tx, run), token, context)
+			.then(
+				() => {
+					if (this.#state !== "sealed") {
+						this.#start(run, invocation);
+						return;
+					}
+					this.#records.cut(run, this.#sealed!.error, this.#sealed!.reason);
+					// No `run` started: nothing else ends it, and an abort joined to it returns.
+					invocation.ended();
+				},
+				() => {
+					invocation.settle();
+					invocation.ended();
+					// Refused because this attempt was sealed (at admission, or queued past the seal): the run is pending still,
+					// for the next live attempt (this one is detached already). Any other failure (the store closed or failed,
+					// the object ended) is not retried here: retrying on this attempt would only fail again.
+					if (this.#state === "sealed") this.#records.requeue(run);
+				},
+			);
+		this.#owner.admit(reserving);
+	}
+
+	/** Starts `invocation` of `run` on this attempt: its ctx and its settling act for this invocation only. */
+	#start(run: JobRun, invocation: Invocation): void {
 		const { context, caller, host } = this.#owner;
-		const ctx = new JobContext(withAbortSignal(run.abort.signal, context), caller, host, run.id, this.#stateOf(run));
+		const signal = invocation.abort.signal;
+		const ctx = new JobContext(
+			withAbortSignal(signal, context),
+			caller,
+			host,
+			run.id,
+			this.#stateOf(run, invocation),
+		);
 		const work = Promise.withResolvers<void>();
-		this.#owner.admit(work.promise, () => ctx.settle());
+		this.#owner.admitRun(work.promise, () => ctx.settle());
 		this.#invocations.add(run);
-		run.invocation = "running";
-		const invocation = (async () => {
+		const running = (async () => {
 			try {
-				return await this.#implementation.run(run.args, ctx);
+				// Its own version's args: a handed-over attempt's late start runs its own code (Sol, reservation).
+				return await this.#implementation.run(this.#records.argsOf(run, this.#definition), ctx);
 			} finally {
 				// The fence closes as `run` settles: a change made later is refused.
-				run.invocation = "settled";
+				invocation.settle();
 			}
 		})();
-		invocation
+		running
 			.then(
-				(result) => this.#settled(run, ctx, { kind: "done", result }),
-				(error: unknown) => this.#settled(run, ctx, this.#failed(run, error)),
+				(result) => this.#settled(run, invocation, ctx, { kind: "done", result }),
+				(error: unknown) => this.#settled(run, invocation, ctx, this.#failed(run, invocation, error)),
 			)
+			.finally(() => invocation.ended())
 			.then(work.resolve);
 	}
 
@@ -214,21 +306,22 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 		this.#owner.admit(work);
 	}
 
-	/** How a throwing `run` ended: `aborted` after its signal fired, otherwise `threw` (reported). */
-	#failed(run: JobRun, error: unknown): Settled {
-		if (run.abort.signal.aborted) return { kind: "failed", error: { kind: "aborted", reason: "abort" } };
+	/** How a throwing `run` ended: `aborted` after its invocation's signal fired, otherwise `threw` (reported). */
+	#failed(run: JobRun, invocation: Invocation, error: unknown): Settled {
+		if (invocation.abort.signal.aborted) return { kind: "failed", error: { kind: "aborted", reason: "abort" } };
 		this.#records.report({ kind: "job_failed", id: run.id, error });
 		const thrown = isChordError(error) || error instanceof PluginError ? error : internal(error);
 		return { kind: "failed", error: { kind: "threw", error: thrown } };
 	}
 
 	/**
-	 * `run` settled: its `ctx.get` references go; its outcome is recorded unless the attempt's seal cut it off (which
-	 * recorded its own), then the run finishes here while this attempt is live.
+	 * `invocation` of `run` settled: its `ctx.get` references go; its outcome is recorded unless the attempt's seal cut
+	 * it off (which recorded its own, or stopped the run for a later invocation), then the run finishes here while this
+	 * attempt is live.
 	 */
-	async #settled(run: JobRun, ctx: JobContext, ended: Settled): Promise<void> {
+	async #settled(run: JobRun, invocation: Invocation, ctx: JobContext, ended: Settled): Promise<void> {
 		ctx.settle();
-		if (run.token.sealed) return;
+		if (invocation.token.sealed || run.invocation !== invocation) return;
 		this.#invocations.delete(run);
 		this.#records.settled(run, ended);
 	}
@@ -238,14 +331,14 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 		this.#finishing.add(run);
 		let delay: number | undefined;
 		try {
-			for (let failures = 1; ; failures++) {
+			for (;;) {
 				try {
 					return await documents.tx(
 						async (tx) => {
 							const staging = this.#records.staging(tx);
 							staging.finishing = run;
-							await this.#implementation.finish?.(run.outcome!, tx);
-							staging.changes.push({ kind: "delete", run });
+							await this.#implementation.finish?.(this.#records.outcomeOf(run, context), tx);
+							this.#records.change(tx, { kind: "delete", run });
 						},
 						token,
 						context,
@@ -253,7 +346,12 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 				} catch (error) {
 					if (this.#state === "sealed") return;
 					this.#records.report({ kind: "job_finish_failed", id: run.id, error });
-					if (failures === FINISH_ATTEMPTS) return await this.#records.record(run, "block");
+					// The count is the run's (stored for a persisted job): failures count across a crash.
+					const finishFailures = run.finishFailures + 1;
+					if (finishFailures >= FINISH_ATTEMPTS) {
+						return await this.#records.record(run, { kind: "block", run, reason: "finish_failed" });
+					}
+					await this.#records.record(run, { kind: "update", run, fields: { finishFailures } });
 					delay = nextDelay(delay);
 					try {
 						await sleep(delay, withAbortSignal(signal, context));
@@ -267,8 +365,8 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 		}
 	}
 
-	/** `ctx.state` of `run`, when the job has a state: changes under the run's own token while `run` runs. */
-	#stateOf(run: JobRun): RunState<JsonObject> | undefined {
+	/** `ctx.state` of `invocation` of `run`, when the job has a state: changes under its token while it runs. */
+	#stateOf(run: JobRun, invocation: Invocation): RunState<JsonObject> | undefined {
 		const records = this.#records;
 		const states = records.states;
 		if (states === undefined) return undefined;
@@ -285,14 +383,57 @@ export class Job implements JobHandle<JsonValue, unknown, JsonValue | undefined>
 				if (value === undefined) throw refused();
 				return value;
 			},
-			change: <T>(fn: (draft: Draft<JsonObject>) => T, context: Context): Promise<T> => {
-				if (run.invocation !== "running") return Promise.reject(refused());
+			change: <T>(
+				fn: (draft: Draft<JsonObject>) => T,
+				context: Context,
+				options: { readonly persistence?: CommitPersistence } = {},
+			): Promise<T> => {
+				if (invocation.state !== "running") return Promise.reject(refused());
+				let persistence: CommitPersistence;
+				try {
+					persistence = checkedPersistence(options.persistence, records.name);
+				} catch (error) {
+					return Promise.reject(error);
+				}
 				// Never the abort signal: a run records its progress also after an abort.
 				const unaborted = withoutAbortSignal(context);
-				return documents.tx(async (tx) => fn(await tx.draftSlot(states, run.id)), run.token, unaborted);
+				// A change resetting the restart count is stored at once: the reset must be durable (D8).
+				const now = run.restarts === 0 ? persistence : IMMEDIATE;
+				return documents.tx(
+					async (tx) => {
+						const value = fn(await tx.draftSlot(states, run.id));
+						records.progressed(tx, run);
+						return value;
+					},
+					invocation.token,
+					unaborted,
+					now,
+				);
 			},
 		};
 	}
+}
+
+const IMMEDIATE: CommitPersistence = { kind: "immediate" };
+
+/**
+ * A state change's `persistence` (a trust boundary: plugin code): `immediate` when omitted; a deferred one's `withinMs`
+ * a number from 0 (`Infinity` waits for the others), `invalid/args` otherwise.
+ */
+function checkedPersistence(persistence: CommitPersistence | undefined, what: string): CommitPersistence {
+	if (persistence === undefined || persistence.kind === "immediate") return IMMEDIATE;
+	const { withinMs } = persistence;
+	if (
+		persistence.kind !== "deferred" ||
+		(withinMs !== undefined && !(typeof withinMs === "number" && withinMs >= 0))
+	) {
+		throw new ChordError({
+			code: "invalid",
+			reason: "args",
+			message: `${what}: persistence is immediate or deferred with withinMs >= 0`,
+		});
+	}
+	return persistence;
 }
 
 /** A plugin's throw that is neither a ChordError nor a PluginError, as a run's outcome keeps it. */

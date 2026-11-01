@@ -4,23 +4,25 @@
 import { type Context, withoutAbortSignal } from "../../context/index.ts";
 import { type Change, type Draft, type Prepared, type Tracker, track } from "../../delta/index.ts";
 import { ChordError } from "../data/index.ts";
+import { asChordError } from "../data/internal.ts";
 import type { JobHandle, Outcome, Run, StartOptions } from "../jobs/index.ts";
 import type { Job } from "../jobs/internal.ts";
 import type { Columns, PutRowOf, RowOf } from "../store/columns.ts";
 import type { Condition, SetOf } from "../store/expression.ts";
 import type { ColumnRefs, Query } from "../store/query.ts";
+import { refusalOf } from "../store/refusal.ts";
 import type { StagedWrite } from "../store/step.ts";
 import type { ChordStore } from "../store/store.ts";
 import type { KeyOf } from "../store/table.ts";
 import { TableChanges } from "../store/table-changes.ts";
 import { type Page, type PageOptions, ROWS_PAGE, type Table, TableHandle } from "../store/table-handle.ts";
-import type { JsonObject } from "./definition.ts";
+import type { CommitPersistence, JsonObject } from "./definition.ts";
 import type { Documents } from "./documents.ts";
 import type { SealToken } from "./fence.ts";
 import type { Keyed, KeyedHandle, Singleton, SingletonHandle } from "./handles.ts";
 import type { KeyedSlot } from "./keyed-slot.ts";
-import { type Stored, type StoredChange, storedAfter } from "./persistence.ts";
-import type { DocumentSlot, SingletonSlot } from "./slot.ts";
+import { checkReadable, type FoundDocument, type Stored, type StoredChange } from "./persistence.ts";
+import type { DocumentSlot, PersistedSlot, SingletonSlot } from "./slot.ts";
 
 /** What `self.tx` gives its callback. Inside it: only `await tx.*`, no other `self.tx`, no calls to other objects. */
 export interface Tx {
@@ -98,6 +100,8 @@ type Entry = {
 	found: Stored | undefined;
 };
 
+const IMMEDIATE: CommitPersistence = { kind: "immediate" };
+
 /**
  * One document change a commit adopts: a removal, a draft's prepared change, or both; and for a persisted document
  * what the commit stores of it.
@@ -108,9 +112,6 @@ type Adoption = {
 	readonly retires: boolean;
 	readonly stored: StoredChange | undefined;
 };
-
-/** The created documents' ids of a commit without store writes: none. */
-const NO_IDS: readonly number[] = [];
 
 /**
  * One transaction of an object, under the seal token of whoever runs it (an attempt, a job run's invocation, the
@@ -135,15 +136,33 @@ export class Transaction implements Tx {
 	#tables: Map<TableHandle, TableChanges> | undefined;
 	/** `tx.*` reads underway: a callback settling with one is refused (rule 3, as Durable's). */
 	#pending = 0;
+	/** When its commit reaches the store (a run state's deferred change, D8). */
+	readonly #persistence: CommitPersistence;
 	#state: "open" | "committing" | "stepping" | "committed" | "discarded" | "cut" = "open";
 	/** Rejected by `cut` while the commit waits in the store's queue: its caller is told at once (rule 3). */
 	#queued: PromiseWithResolvers<never> | undefined;
 
-	constructor(documents: Documents, token: SealToken, release: () => void, context: Context) {
+	constructor(
+		documents: Documents,
+		token: SealToken,
+		release: () => void,
+		context: Context,
+		persistence: CommitPersistence = IMMEDIATE,
+	) {
 		this.#documents = documents;
 		this.token = token;
 		this.#release = release;
 		this.#context = context;
+		this.#persistence = persistence;
+	}
+
+	/**
+	 * The store writes of this transaction, which `write`s join (Chord's own documents: a job's run records): made by the
+	 * first, which sends the commit through `store`'s step.
+	 */
+	stageStore(store: ChordStore): StagedWrite[] {
+		this.#writes ??= { store, staged: [] };
+		return this.#writes.staged;
 	}
 
 	/** The object whose transaction this is. */
@@ -195,9 +214,14 @@ export class Transaction implements Tx {
 		const at = key === "" ? key : slot.key(key);
 		const entry = this.retireSlot(slot, at);
 		const persisted = slot.persisted;
-		// A cold persisted document is found, not loaded (one read; absent: a no-op, R13).
+		// A cold persisted document is found, not loaded (one read; absent: a no-op, R13); a version or fingerprint
+		// the code cannot read fails the owner as a load would (R15): a retirement of it is no exception.
 		if (entry.found === undefined && persisted?.cold(at)) {
-			entry.found = await this.#track(persisted.persistence.find(at, this.#context));
+			const found = await this.#track(persisted.persistence.find(at, this.#context));
+			// Cut meanwhile: its attempt was sealed, and failing the owner now would fail its successor.
+			this.#assertOpen();
+			if (found !== undefined) checkFound(found, persisted, slot);
+			entry.found = found?.stored;
 		}
 	}
 
@@ -311,7 +335,6 @@ export class Transaction implements Tx {
 		this.#state = "committing";
 		this.#context.abortSignal?.throwIfAborted();
 		const adoptions: Adoption[] = [];
-		let creations = 0;
 		for (const entries of this.#entries.values()) {
 			for (const entry of entries.values()) {
 				let prepared = entry.draft?.change.prepare();
@@ -325,19 +348,16 @@ export class Transaction implements Tx {
 				const persisted = slot.persisted;
 				let stored: StoredChange | undefined;
 				if (persisted !== undefined) {
-					const { persistence, definition } = persisted;
-					this.#writes ??= { store: persistence.store, staged: [] };
-					const change = { prepared, retires };
+					const writes = this.stageStore(persisted.persistence.store);
 					const was = persisted.stored(key) ?? entry.found;
-					stored = persistence.stage(key, definition.current, was, change, this.#writes.staged, creations);
-					if (stored.kind === "create") creations++;
+					stored = persisted.stage(key, { prepared, retires }, was, writes, this.#persistence);
 				}
 				adoptions.push({ entry, prepared, retires, stored });
 			}
 		}
 		const writes = this.#writes;
 		if (writes === undefined) {
-			this.#adopt(adoptions, NO_IDS);
+			this.#adopt(adoptions);
 			this.#state = "committed";
 			return;
 		}
@@ -356,7 +376,7 @@ export class Transaction implements Tx {
 				this.#state = "stepping";
 				return true;
 			},
-			adopt: (_seq: number, ids: readonly number[]) => this.#adopt(adoptions, ids),
+			adopt: () => this.#adopt(adoptions),
 		};
 		this.#queued = Promise.withResolvers<never>();
 		try {
@@ -364,7 +384,7 @@ export class Transaction implements Tx {
 			await Promise.race([store.commit(staged, fence, withoutAbortSignal(this.#context)), this.#queued.promise]);
 		} catch (error) {
 			if (this.#state === "cut") throw this.#cutError();
-			throw error;
+			throw this.#refused(error);
 		} finally {
 			this.#queued = undefined;
 		}
@@ -372,18 +392,29 @@ export class Transaction implements Tx {
 	}
 
 	/**
-	 * Adopts the changed documents (persisted ones with what is stored of them, `ids` being the commit's created
-	 * documents' ids) and the staged changes in one batch; nothing when nothing changed.
+	 * The error a commit the store rejected rejects with (D4): the store's own (`released`, `storage_failed`) as it
+	 * is; a refused step classified, an `int` `CHECK` failing only this transaction (`invalid/args`), any other refusal
+	 * failing the live object `broken` too (memory and disk disagree).
 	 */
-	#adopt(adoptions: readonly Adoption[], ids: readonly number[]): void {
+	#refused(error: unknown): unknown {
+		const refusal = refusalOf(error, this.#documents.label);
+		if (refusal === undefined) return error;
+		if (refusal.kind === "broken") this.#documents.fail(refusal.error);
+		return refusal.error;
+	}
+
+	/**
+	 * Adopts the changed documents (persisted ones with what the commit stored of them) and the staged changes in one
+	 * batch; nothing when nothing changed.
+	 */
+	#adopt(adoptions: readonly Adoption[]): void {
 		const staged = this.#staged;
 		if (adoptions.length === 0 && staged === undefined) return;
 		this.#documents.batch.commit(() => {
 			for (const { entry, prepared, retires, stored } of adoptions) {
 				if (retires) entry.slot.retire(entry.key);
 				if (prepared === undefined) continue;
-				const after = stored === undefined ? undefined : storedAfter(stored, ids);
-				entry.slot.adopt(entry.key, entry.draft!.tracker, prepared, after);
+				entry.slot.adopt(entry.key, entry.draft!.tracker, prepared, stored);
 			}
 			for (const each of staged?.values() ?? []) each.adopt();
 		}, this.#context);
@@ -471,6 +502,7 @@ export class Transaction implements Tx {
 		if (!(handle instanceof TableHandle) || handle.owner.scope !== this.#documents) {
 			throw new Error(`${this.#documents.label}: a transaction writes only its own object's tables`);
 		}
+		handle.assertVersion();
 		return handle;
 	}
 
@@ -506,5 +538,16 @@ export class Transaction implements Tx {
 			entry.draft = { tracker, change: tracker.beginChange() };
 		}
 		return entry.draft.change.state;
+	}
+}
+
+/** Throws, failing `slot`'s owner `broken`, when its definition cannot read the cold document `found` (R15). */
+function checkFound(found: FoundDocument, persisted: PersistedSlot, slot: DocumentSlot): void {
+	try {
+		checkReadable({ version: found.stored.version, fingerprint: found.fingerprint }, persisted.definition.current);
+	} catch (error) {
+		const failure = asChordError(error, slot.owner.label);
+		slot.owner.fail(failure);
+		throw failure;
 	}
 }

@@ -3,7 +3,8 @@
  *
  *   node --conditions=source --experimental-strip-types --expose-gc test/conversation-view-bench.ts
  *
- * Scenarios, each in its own child process so heap numbers are its own, on SQLite so history stays out of the heap:
+ * Scenarios, each in its own child process so heap numbers are its own, on SQLite so history stays out of the heap
+ * (`SqliteStorage`; with `PI_DURABLE_BENCH_STORAGE=store`, Durable's storage on Chord's store, `StoreStorage`):
  * - `start`: acquire a watch of a conversation of N entries (the mount is built every time; the watch is stopped).
  * - `append`: K started watches; commit entries one per commit, or in bursts of 50 per commit, and wait for delivery.
  * - `resume`: a watch with `from` 20 entries back, as a client that reconnects after a short drop.
@@ -22,6 +23,7 @@ import { BACKGROUND_CONTEXT as context } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { type Conversation, createRegistry, type EntryId, Harness, LiveDoc, type Storage } from "../src/index.ts";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
+import { openStoreStorage } from "./store-storage-support.ts";
 
 type Scenario =
 	| { kind: "start"; entries: number }
@@ -114,7 +116,11 @@ async function run(scenario: Scenario): Promise<Record<string, number>> {
 	const directory = mkdtempSync(join(tmpdir(), "pi-durable-view-bench-"));
 	let storage: Storage | undefined;
 	try {
-		storage = await openNodeSqliteStorage(join(directory, "session.sqlite"));
+		const path = join(directory, "session.sqlite");
+		storage =
+			process.env.PI_DURABLE_BENCH_STORAGE === "store"
+				? await openStoreStorage(path)
+				: await openNodeSqliteStorage(path);
 		const models = createModels();
 		const harness = await Harness.open(storage, { models, registry: createRegistry() }, context);
 		const root = await harness.root(context);

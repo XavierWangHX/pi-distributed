@@ -11,8 +11,8 @@ import type { StoreWrite } from "./writes.ts";
 /** The write vocabulary's version an outbox commit is stored in; a newer one is refused, data intact. */
 export const OUTBOX_FORMAT = 1;
 
-/** One commit as the outbox gives it. */
-export type OutboxCommit = { readonly seq: number; readonly writes: readonly StoreWrite[] };
+/** One commit as the outbox gives it: its seq, the allocator's value it persisted (D3) and its writes in applied order. */
+export type OutboxCommit = { readonly seq: number; readonly nextId: number; readonly writes: readonly StoreWrite[] };
 
 const NOTHING = (): void => {};
 
@@ -73,19 +73,24 @@ export class Outbox {
 		}
 		const rows = await this.#store.read(
 			(executor) =>
-				executor.all<{ readonly seq: number; readonly format: number; readonly writes: string }>(
-					`SELECT seq, format, writes FROM ${TABLES.outbox} WHERE seq > ? ORDER BY seq LIMIT ?`,
+				executor.all<{
+					readonly seq: number;
+					readonly format: number;
+					readonly next_id: number;
+					readonly writes: string;
+				}>(
+					`SELECT seq, format, next_id, writes FROM ${TABLES.outbox} WHERE seq > ? ORDER BY seq LIMIT ?`,
 					afterSeq,
 					limit,
 				),
 			context,
 		);
-		return rows.map(({ seq, format, writes }) => {
+		return rows.map(({ seq, format, next_id, writes }) => {
 			if (format !== OUTBOX_FORMAT) {
 				const message = `outbox: commit ${seq} is in format ${format}, newer than ${OUTBOX_FORMAT}`;
 				throw new ChordError({ code: "unavailable", message });
 			}
-			return { seq, writes: JSON.parse(writes) as StoreWrite[] };
+			return { seq, nextId: next_id, writes: JSON.parse(writes) as StoreWrite[] };
 		});
 	}
 

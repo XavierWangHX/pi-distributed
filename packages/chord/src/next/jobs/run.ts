@@ -1,5 +1,7 @@
-// One run of a job (§15): its record (id, version, key, args, phase, outcome), its abort signal, the fence of its
-// invocation (its seal token), its `running` entry and the `Run` handle its callers wait on.
+// One run of a job (§15, slice 6b §4.1): its record (id, version, key, args, phase, restarts, finish failures, abort
+// mark, outcome), its current invocation (the fence of its seal token, its abort signal, the end an abort joins: one
+// per invocation, as a persisted run is invoked again after a seal, R3), its `running` entry and the `Run` handle its
+// callers wait on.
 
 import type { Context } from "../../context/index.ts";
 import type { JsonValue } from "../../json.ts";
@@ -23,13 +25,19 @@ export interface Run<O> {
 export type AnyOutcome = Outcome<JsonValue, unknown, JsonValue | undefined>;
 
 /**
- * Where a run's record stands. `running` from its start's commit (its `run` starts after it), `finishing` once its
- * outcome is recorded, `blocked` after five failed finishes.
+ * Where a run's record stands. A persisted run is `pending` from its start's commit until its reservation commit
+ * (`running`, then its `run` starts), `stopped` once a clean stop cut it off; an in-memory run is `running` from its
+ * start's commit. `finishing` once its outcome is recorded, `blocked` after five failed finishes or for another
+ * version.
  */
-type Phase = "running" | "finishing" | "blocked";
+export type Phase = "pending" | "running" | "stopped" | "finishing" | "blocked";
 
-/** Where a run's invocation stands: `ctx.state.change` is admitted only while it runs (the invocation fence). */
-type Invocation = "pending" | "running" | "settled";
+/**
+ * Why a run is blocked: its `finish` failed five times in a row, or its version is not the code's (stored by another
+ * job version or fingerprint, of a newer version or an older one without an adapter, or of a job the code no longer
+ * declares, slice 7b §8).
+ */
+export type BlockedReason = "finish_failed" | "version";
 
 /** How a run settled for its waiters. */
 type Answer =
@@ -42,16 +50,31 @@ type Waiter = { readonly settle: (settled: Answer) => void };
 /** One run: changed only by its job, inside its transactions' commit steps (records) and after them (actions). */
 export class JobRun {
 	readonly id: string;
+	/** The job version it was started with: it keeps it across reloads (slice 7b §8). */
 	readonly version: number;
+	/** The fingerprint of its job version (a persisted run's record keeps it). */
+	readonly fingerprint: string;
 	readonly key: string | undefined;
 	readonly args: JsonValue;
-	/** `run`'s abort signal: `abort(id)`, the object's end and `host.close` fire it; an early abort pre-marks it. */
-	readonly abort = new AbortController();
 	readonly handle: Run<AnyOutcome>;
-	/** The seal token of its invocation: sealed when the invocation is cut off by its attempt's seal (`ctx.state.change`). */
-	readonly token = new SealToken();
-	phase: Phase = "running";
-	invocation: Invocation = "pending";
+	/** Its args and outcome mapped forwards to the job's current version (once per run and version), when older. */
+	mapped: { readonly version: number; readonly args: JsonValue; outcome?: AnyOutcome } | undefined;
+	/** A persisted run blocked for its version at its load: the phase its record had, resumed when unblocked. */
+	blockedPhase: Phase | undefined;
+	/** Its current invocation, from its reservation (or its start in memory) on; a later one replaces it. */
+	invocation: Invocation | undefined;
+	phase: Phase;
+	/** A persisted run's crashes in a row while running (D6); reset by a state change. */
+	restarts = 0;
+	/** Failed finishes in a row (stored for a persisted run, so they count across a crash). */
+	finishFailures = 0;
+	/** Set by `abort(id)` (stored for a persisted run, D7): a run not invoked yet ends `aborted` without `run`. */
+	abortMarked = false;
+	/** A persisted run cut off by a crash or a clean stop, to be resumed per its job's `resume` (no new start). */
+	resuming = false;
+	blocked: BlockedReason | undefined;
+	/** The start's trace carrier, when the adapter propagates (stored, slice 9 uses it). */
+	readonly trace: { readonly [key: string]: string } | undefined;
 	/** What it ended with, once recorded (finishing and blocked). */
 	outcome: AnyOutcome | undefined;
 	/** Its entry in `running`, while its record exists; replaced when its record or state document changes. */
@@ -59,27 +82,63 @@ export class JobRun {
 	/** Its waiters: apart from the run, so a handle kept by a caller keeps only how the run settled. */
 	readonly #waiters = new Waiters();
 
-	constructor(id: string, version: number, key: string | undefined, args: JsonValue) {
+	constructor(
+		id: string,
+		version: number,
+		fingerprint: string,
+		key: string | undefined,
+		args: JsonValue,
+		phase: Phase,
+		trace?: { readonly [key: string]: string },
+	) {
 		this.id = id;
 		this.version = version;
+		this.fingerprint = fingerprint;
 		this.key = key;
 		this.args = args;
+		this.phase = phase;
+		this.trace = trace;
 		const waiters = this.#waiters;
 		this.handle = { id, outcome: (context) => waiters.wait(context) };
 	}
 
-	/** Its `running` entry for its current record and `state` (the job's state document, `undefined` without one). */
-	entryFor(state: JsonValue | undefined): JsonValue {
-		const { id, version, key, args, phase } = this;
-		if (phase === "blocked") return { id, version, phase, reason: "finish_failed" };
+	/**
+	 * Its `running` entry for its current record, `state` (the job's state document, `undefined` without one) and
+	 * `args` (mapped forwards for an older version): a pending or stopped run shows as `running` (it runs, or will run
+	 * again).
+	 */
+	entryFor(state: JsonValue | undefined, args: JsonValue): JsonValue {
+		const { id, version, key, phase } = this;
+		if (phase === "blocked") return { id, version, phase, reason: this.blocked! };
 		return {
 			id,
 			version,
 			...(key === undefined ? {} : { key }),
 			args,
 			...(state === undefined ? {} : { state }),
-			phase,
+			phase: phase === "finishing" ? "finishing" : "running",
 		};
+	}
+
+	/** A new invocation, the current one from now on (a run marked aborted is never invoked: it ends without one). */
+	begin(): Invocation {
+		const invocation = new Invocation();
+		this.invocation = invocation;
+		return invocation;
+	}
+
+	/** Whether its current invocation runs (or is reserved): it is not invoked again meanwhile. */
+	get invoked(): boolean {
+		return this.invocation?.state === "running";
+	}
+
+	/**
+	 * Resolves once its current invocation ended, at once when none runs (`abort` joins it; one a seal cut off is
+	 * fenced and is not waited for); `context` ends only the wait.
+	 */
+	over(context: Context): Promise<void> {
+		const invocation = this.invocation;
+		return invocation?.state === "running" ? invocation.over(context) : Promise.resolve();
 	}
 
 	/** Its waiters get the outcome. */
@@ -90,6 +149,35 @@ export class JobRun {
 	/** Its waiters get `error`. */
 	reject(error: ChordError): void {
 		this.#waiters.settle({ kind: "failed", error });
+	}
+}
+
+/**
+ * One invocation of a run's `run`: its fence (`ctx.state.change` admitted while it runs, under its own seal token,
+ * which its attempt's seal fences), its abort signal and the waits for its end. Captured by its ctx and its settling,
+ * so a replaced invocation never acts for its successor.
+ */
+export class Invocation {
+	readonly token = new SealToken();
+	/** `run`'s abort signal: `abort(id)`, the attempt's seal, the object's end and `host.close` fire it. */
+	readonly abort = new AbortController();
+	/** `running` from its reservation until `run` settled or a seal cut it off. */
+	state: "running" | "settled" = "running";
+	readonly #joins = new Joins();
+
+	/** The fence closes: a change made later is refused. */
+	settle(): void {
+		this.state = "settled";
+	}
+
+	/** Nothing of it runs here any more (its `run` settled, or the object ended): every join resolves. */
+	ended(): void {
+		this.#joins.end();
+	}
+
+	/** Resolves once it ended; `context` ends only the wait. */
+	over(context: Context): Promise<void> {
+		return this.#joins.wait(context);
 	}
 }
 
@@ -134,4 +222,37 @@ class Waiters {
 /** A settled run's answer to a wait. */
 function answer(settled: Answer): Promise<AnyOutcome> {
 	return settled.kind === "done" ? Promise.resolve(settled.outcome) : Promise.reject(settled.error);
+}
+
+/** The waits for a run's invocation to be over: each removed when its context aborts, so a cancelled one keeps nothing. */
+class Joins {
+	#over = false;
+	readonly #waiting = new Set<() => void>();
+
+	/** The invocation is over (once): every wait resolves. */
+	end(): void {
+		if (this.#over) return;
+		this.#over = true;
+		for (const resolve of this.#waiting) resolve();
+		this.#waiting.clear();
+	}
+
+	/** A wait: at once when over; otherwise until it is or `context` aborts (rejecting with its reason). */
+	wait(context: Context): Promise<void> {
+		if (this.#over) return Promise.resolve();
+		const signal = context.abortSignal;
+		if (signal?.aborted) return Promise.reject(signal.reason);
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const abort = (): void => {
+			this.#waiting.delete(done);
+			reject(signal?.reason);
+		};
+		const done = (): void => {
+			signal?.removeEventListener("abort", abort);
+			resolve();
+		};
+		this.#waiting.add(done);
+		signal?.addEventListener("abort", abort, { once: true });
+		return promise;
+	}
 }

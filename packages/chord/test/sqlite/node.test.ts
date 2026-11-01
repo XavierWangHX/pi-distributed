@@ -1,7 +1,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import type { SqliteExecutor } from "../../src/sqlite/index.ts";
-import { openNodeSqliteDatabase } from "../../src/sqlite/node.ts";
+import { NodeSqliteDatabase, openNodeSqliteDatabase } from "../../src/sqlite/node.ts";
 import { RUN_CHANGES, runChanges } from "./helpers.ts";
 
 describe("Node SQLite driver", () => {
@@ -196,5 +196,50 @@ describe("Node SQLite driver", () => {
 		).rejects.toThrow(AggregateError);
 		expect(await database.get("SELECT value FROM rollback_probe")).toEqual({ value: 1 });
 		await database.close();
+	});
+});
+
+describe("the outcome of a transaction (slice 6b D4)", () => {
+	/** A facade on `:memory:` whose next `statement` throws (and a `ROLLBACK` still rolls back). */
+	function faulty(statement?: "BEGIN IMMEDIATE" | "COMMIT" | "ROLLBACK") {
+		const database = new DatabaseSync(":memory:");
+		const exec = database.exec.bind(database);
+		let failing = statement;
+		database.exec = (sql: string): void => {
+			if (sql !== failing) {
+				exec(sql);
+				return;
+			}
+			failing = undefined;
+			if (sql === "ROLLBACK") exec(sql);
+			throw new Error(`${sql} failed`);
+		};
+		return new NodeSqliteDatabase(database);
+	}
+
+	it("rejects with the callback's own error after a rollback: the caller knows it never committed", async () => {
+		const database = faulty();
+		const own = new Error("refused");
+		await database.exec("CREATE TABLE t (n INTEGER)");
+		const outcome = database.transaction(async (handle) => {
+			await handle.run("INSERT INTO t VALUES (1)");
+			throw own;
+		});
+		await expect(outcome).rejects.toBe(own);
+		expect(await database.all("SELECT n FROM t")).toEqual([]);
+	});
+
+	it.each(["BEGIN IMMEDIATE", "COMMIT"] as const)("rejects with another error when %s fails", async (statement) => {
+		const database = faulty(statement);
+		const outcome = database.transaction(async () => 1);
+		await expect(outcome).rejects.toThrow(`${statement} failed`);
+	});
+
+	it("rejects with an AggregateError, not the callback's error, when its ROLLBACK fails", async () => {
+		const database = faulty("ROLLBACK");
+		const own = new Error("refused");
+		const error = await database.transaction(async () => Promise.reject(own)).catch((thrown: unknown) => thrown);
+		expect(error).toBeInstanceOf(AggregateError);
+		expect(error).not.toBe(own);
 	});
 });
